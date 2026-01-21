@@ -6,12 +6,10 @@ import equinox as eqx
 import numpy as np
 
 
-class CatchEnvironment(eqx.Module):
+class CatchEnvironmentState(eqx.Module):
     """
-    An implementation of the Catch environment with additional features like hot bit,
-    reset bit, catch bit, miss bit, plus bit, and minus bit.
+    State of the Catch environment containing all parameters (both static and dynamic).
     """
-    
     # Static parameters (configuration)
     rows: int = eqx.field(static=True)
     cols: int = eqx.field(static=True)
@@ -43,7 +41,7 @@ class CatchEnvironment(eqx.Module):
         reward_indicator_duration_max: int = 3,
         seed: Optional[int] = None,
     ):
-        """Initialize the Catch environment with the given parameters."""
+        """Initialize the Catch environment state with the given parameters."""
         super().__init__()
         
         # Store static configuration
@@ -74,34 +72,45 @@ class CatchEnvironment(eqx.Module):
         self.plus_bit = jnp.array(False)
         self.minus_bit = jnp.array(False)
         self.reward_countdown = jnp.array(0)
+
+
+class CatchEnvironment(eqx.Module):
+    """
+    An implementation of the Catch environment with additional features like hot bit,
+    reset bit, catch bit, miss bit, plus bit, and minus bit.
     
-    def _get_observation(self) -> jax.Array:
+    This class contains only static methods. All parameters and state are stored in
+    CatchEnvironmentState.
+    """
+    
+    @staticmethod
+    def _get_observation(state: CatchEnvironmentState) -> jax.Array:
         """
         Construct the observation vector based on the current state.
         The observation is a 1D array of 50 bits for the board, plus 6 bits for
         hot, reset, catch, miss, plus, and minus bits.
         """
         # Initialize empty board (10x5 = 50 elements)
-        board = jnp.zeros((self.rows, self.cols), dtype=jnp.int32)
+        board = jnp.zeros((state.rows, state.cols), dtype=jnp.int32)
         
         # Place ball on board if it's not in reset
-        valid_ball_pos = ~self.in_reset & (self.ball_row >= 0) & (self.ball_row < self.rows)
-        board = board.at[self.ball_row, self.ball_col].set(jnp.where(valid_ball_pos, 1, 0))
+        valid_ball_pos = ~state.in_reset & (state.ball_row >= 0) & (state.ball_row < state.rows)
+        board = board.at[state.ball_row, state.ball_col].set(jnp.where(valid_ball_pos, 1, 0))
         
         # Place paddle on board (always on bottom row)
-        board = board.at[self.rows - 1, self.paddle_col].set(1)
+        board = board.at[state.rows - 1, state.paddle_col].set(1)
         
         # Flatten board and append special bits
         flat_board = board.flatten()
         
         # Append special bits: [hot, reset, catch, miss, plus, minus]
         special_bits = jnp.array([
-            self.is_hot, 
-            self.in_reset, 
-            self.catch_bit, 
-            self.miss_bit, 
-            self.plus_bit, 
-            self.minus_bit
+            state.is_hot, 
+            state.in_reset, 
+            state.catch_bit, 
+            state.miss_bit, 
+            state.plus_bit, 
+            state.minus_bit
         ], dtype=jnp.int32)
         
         # Concatenate board and special bits
@@ -109,11 +118,13 @@ class CatchEnvironment(eqx.Module):
         
         return observation
     
-    def step(self, action: int) -> Tuple[Any, jax.Array, jax.Array, Dict]:
+    @staticmethod
+    def step(state: CatchEnvironmentState, action: int) -> Tuple[CatchEnvironmentState, jax.Array, jax.Array, Dict]:
         """
         Take a step in the environment based on the provided action.
         
         Args:
+            state: The current environment state
             action: 0 (left), 1 (stay), or 2 (right)
             
         Returns:
@@ -122,24 +133,24 @@ class CatchEnvironment(eqx.Module):
         # Update paddle position based on action
         # 0: left, 1: stay, 2: right
         paddle_col = jnp.clip(
-            self.paddle_col + jnp.array([-1, 0, 1])[action],
+            state.paddle_col + jnp.array([-1, 0, 1])[action],
             0,
-            self.cols - 1,
+            state.cols - 1,
         )
         
         # Initialize reward to zero
         reward = jnp.array(0.0)
         
         # Get current state
-        ball_row = self.ball_row
-        ball_col = self.ball_col
-        in_reset = self.in_reset
-        is_hot = self.is_hot
-        catch_bit = self.catch_bit
-        miss_bit = self.miss_bit
-        plus_bit = self.plus_bit
-        minus_bit = self.minus_bit
-        reward_countdown = self.reward_countdown
+        ball_row = state.ball_row
+        ball_col = state.ball_col
+        in_reset = state.in_reset
+        is_hot = state.is_hot
+        catch_bit = state.catch_bit
+        miss_bit = state.miss_bit
+        plus_bit = state.plus_bit
+        minus_bit = state.minus_bit
+        reward_countdown = state.reward_countdown
         
         # === HANDLE BIT FLOW: catch/miss -> plus/minus -> reset ===
         # Flow logic:
@@ -163,12 +174,12 @@ class CatchEnvironment(eqx.Module):
         should_activate_reset_from_catch_miss = (catch_was_active | miss_was_active) & ~is_hot
         
         # Generate random duration for plus/minus if needed
-        key, subkey4 = random.split(self.rng)
+        key, subkey4 = random.split(state.rng)
         duration = random.randint(
             subkey4, 
             (), 
-            self.reward_indicator_duration_min,
-            self.reward_indicator_duration_max + 1
+            state.reward_indicator_duration_min,
+            state.reward_indicator_duration_max + 1
         )
         
         # Activate plus/minus if catch/miss happened and hot is True
@@ -198,12 +209,12 @@ class CatchEnvironment(eqx.Module):
         
         # If reward countdown reached 0, issue reward
         reward = jnp.where(
-            plus_minus_just_finished & self.plus_bit,
+            plus_minus_just_finished & plus_bit,
             1.0,
             reward,
         )
         reward = jnp.where(
-            plus_minus_just_finished & self.minus_bit,
+            plus_minus_just_finished & minus_bit,
             -1.0,
             reward,
         )
@@ -218,7 +229,7 @@ class CatchEnvironment(eqx.Module):
         
         # == HANDLE BALL HITTING BOTTOM ROW ==
         # Check if ball is at bottom (before updating in_reset)
-        ball_at_bottom = (ball_row == self.rows - 1) & ~in_reset
+        ball_at_bottom = (ball_row == state.rows - 1) & ~in_reset
         
         # Determine if the ball is caught or missed
         is_caught = ball_at_bottom & (ball_col == paddle_col)
@@ -234,11 +245,11 @@ class CatchEnvironment(eqx.Module):
         # Ball can only enter if in_reset was True in the PREVIOUS step
         # (not if it's being set to True in this step)
         key, subkey1 = random.split(key)
-        will_enter_board = random.uniform(subkey1) < self.reset_prob
+        will_enter_board = random.uniform(subkey1) < state.reset_prob
         
         # When in reset, ball may enter the board with probability reset_prob
         # Ball can only enter when in_reset was True in the previous step (no other dependencies)
-        ball_enters = self.in_reset & will_enter_board & (ball_row == -1)
+        ball_enters = state.in_reset & will_enter_board & (ball_row == -1)
         
         # Set in_reset based on the flow logic (for next step)
         in_reset = jnp.where(should_activate_reset, True, in_reset)
@@ -246,19 +257,19 @@ class CatchEnvironment(eqx.Module):
         
         # When ball enters, determine if board becomes hot (only set when entering)
         key, subkey2 = random.split(key)
-        becomes_hot = random.uniform(subkey2) < self.hot_prob
+        becomes_hot = random.uniform(subkey2) < state.hot_prob
         is_hot = jnp.where(ball_enters, becomes_hot, is_hot)
         
         # Place ball in top row at random column when entering
         key, subkey3 = random.split(key)
-        new_col = random.randint(subkey3, (), 0, self.cols)
+        new_col = random.randint(subkey3, (), 0, state.cols)
         ball_row = jnp.where(ball_enters, jnp.array(0), ball_row)
         ball_col = jnp.where(ball_enters, new_col, ball_col)
         in_reset = jnp.where(ball_enters, False, in_reset)
         
         # Advance ball if not in reset and not at bottom and not entering
         # Ball must be at a valid position (not -1) to advance
-        normal_fall = ~in_reset & ~ball_at_bottom & ~ball_enters & (ball_row >= 0) & (ball_row < self.rows - 1)
+        normal_fall = ~in_reset & ~ball_at_bottom & ~ball_enters & (ball_row >= 0) & (ball_row < state.rows - 1)
         ball_row = jnp.where(normal_fall, ball_row + 1, ball_row)
         
         # Construct new state
@@ -268,7 +279,7 @@ class CatchEnvironment(eqx.Module):
                 t.is_hot, t.catch_bit, t.miss_bit, t.plus_bit, t.minus_bit,
                 t.reward_countdown
             ),
-            self,
+            state,
             (
                 key, ball_row, ball_col, paddle_col, in_reset, 
                 is_hot, catch_bit, miss_bit, plus_bit, minus_bit,
@@ -277,7 +288,7 @@ class CatchEnvironment(eqx.Module):
         )
         
         # Get observation
-        observation = new_state._get_observation()
+        observation = CatchEnvironment._get_observation(new_state)
         
         # Info dictionary
         info = {
@@ -295,36 +306,37 @@ class CatchEnvironment(eqx.Module):
         
         return new_state, observation, reward, info
     
-    def reset(self, key: Optional[random.PRNGKey] = None) -> Tuple[Any, jax.Array]:
+    @staticmethod
+    def reset(state: CatchEnvironmentState, key: Optional[random.PRNGKey] = None) -> Tuple[CatchEnvironmentState, jax.Array]:
         """Reset the environment to an initial state."""
         if key is None:
-            key, subkey = random.split(self.rng)
+            key, subkey = random.split(state.rng)
         else:
             key, subkey = random.split(key)
         
-        # Create a fresh environment with the same static parameters
-        new_env = CatchEnvironment(
-            rows=self.rows,
-            cols=self.cols,
-            hot_prob=self.hot_prob,
-            reset_prob=self.reset_prob,
-            reward_indicator_duration_min=self.reward_indicator_duration_min,
-            reward_indicator_duration_max=self.reward_indicator_duration_max,
+        # Create a fresh state with the same static parameters
+        new_state = CatchEnvironmentState(
+            rows=state.rows,
+            cols=state.cols,
+            hot_prob=state.hot_prob,
+            reset_prob=state.reset_prob,
+            reward_indicator_duration_min=state.reward_indicator_duration_min,
+            reward_indicator_duration_max=state.reward_indicator_duration_max,
             seed=random.randint(subkey, (), 0, 1000000000).item()
         )
         
         # Get observation
-        observation = new_env._get_observation()
+        observation = CatchEnvironment._get_observation(new_state)
         
-        return new_env, observation
+        return new_state, observation
     
-    @property
-    def observation_space_size(self) -> int:
+    @staticmethod
+    def observation_space_size(state: CatchEnvironmentState) -> int:
         """Return the size of the observation space."""
-        return self.rows * self.cols + 6  # board + 6 special bits
+        return state.rows * state.cols + 6  # board + 6 special bits
     
-    @property
-    def action_space_size(self) -> int:
+    @staticmethod
+    def action_space_size(state: CatchEnvironmentState) -> int:
         """Return the size of the action space."""
         return 3  # left, stay, right
 
@@ -338,11 +350,11 @@ def main():
     import imageio
     from io import BytesIO
 
-    # Create environment
-    env = CatchEnvironment(seed=42, hot_prob=1.0, reset_prob=1.0)
+    # Create environment state
+    state = CatchEnvironmentState(seed=42, hot_prob=0.5, reset_prob=0.3)
 
     # Reset the environment
-    env, obs = env.reset()
+    state, obs = CatchEnvironment.reset(state)
 
     # Run a few steps
     total_reward = 0
@@ -352,10 +364,10 @@ def main():
     frames = []
 
     # Create a function to create a frame image
-    def create_frame(obs, env, step_num):
+    def create_frame(obs, state, step_num):
         """Create a frame image for the current state."""
-        board = obs[:env.rows * env.cols].reshape(env.rows, env.cols)
-        special_bits = obs[env.rows * env.cols:]
+        board = obs[:state.rows * state.cols].reshape(state.rows, state.cols)
+        special_bits = obs[state.rows * state.cols:]
 
         fig, ax = plt.subplots(figsize=(5, 10))
         ax.imshow(board, cmap='Blues')
@@ -366,7 +378,7 @@ def main():
 
         for i, (name, status) in enumerate(zip(special_bit_names, special_bit_status)):
             ax.text(
-                -1.5, env.rows + i * 0.5,
+                -1.5, state.rows + i * 0.5,
                 f"{name}: {status}",
                 fontsize=10
             )
@@ -390,11 +402,11 @@ def main():
         action = np.random.randint(0, 3)
 
         # Take a step
-        env, obs, reward, info = env.step(action)
+        state, obs, reward, info = CatchEnvironment.step(state, action)
         total_reward += reward.item()
 
         # Create frame for GIF (all steps)
-        frame = create_frame(obs, env, step)
+        frame = create_frame(obs, state, step)
         frames.append(frame)
 
         # Print info for significant events
@@ -417,38 +429,53 @@ def main():
 
     print(f"Total reward after {n_steps} steps: {total_reward}")
     
-    # # Test jitting the step function
-    # print("Testing JIT compilation...")
-    # import time
+    ##### JIT TESTING #####
     
-    # def run_steps(env, n_steps=1000):
-    #     """Run steps in the environment."""
-    #     for _ in range(n_steps):
-    #         action = 1  # Always stay
-    #         env, _, _, _ = env.step(action)
-    #     return env
+    print("Testing JIT + scan compilation...")
     
-    # # Create a fresh environment
-    # env = CatchEnvironment(seed=123)
-    
-    # # Time normal execution
-    # start = time.time()
-    # env = run_steps(env)
-    # normal_time = time.time() - start
-    
-    # # Time jitted execution
-    # jitted_run_steps = jax.jit(
-    #     lambda env: run_steps(env)
-    # )
-    # jitted_run_steps(env).block_until_ready()
+    import time
+    from functools import partial
 
-    # start = time.time()
-    # env = jitted_run_steps(env).block_until_ready()
-    # jitted_time = time.time() - start
-    
-    # print(f"Normal execution time: {normal_time:.4f}s")
-    # print(f"Jitted execution time: {jitted_time:.4f}s")
-    # print(f"Speedup: {normal_time / jitted_time:.2f}x")
+    # Define a jitted step function that processes (state, action) -> (state, outputs)
+    @jax.jit
+    def jitted_step_fn(state, action):
+        return CatchEnvironment.step(state, action)
+
+    def run_steps_with_scan(state, n_steps=1000):
+        """Run n_steps using jax.lax.scan and always 'stay' action."""
+        actions = jnp.ones(n_steps, dtype=jnp.int32)  # Always stay (action=1)
+        def scan_fn(state, action):
+            state, _, _, _ = jitted_step_fn(state, action)
+            return state, None
+        final_state, _ = jax.lax.scan(scan_fn, state, actions)
+        return final_state
+
+    # Create a fresh state
+    state = CatchEnvironmentState(seed=123)
+
+    # Time normal Python loop (un-jitted, no scan)
+    def vanilla_run_steps(state, n_steps=1000):
+        for _ in range(n_steps):
+            state, _, _, _ = CatchEnvironment.step(state, 1)
+        return state
+
+    start = time.time()
+    state_vanilla = vanilla_run_steps(state, n_steps=100)
+    normal_time = time.time() - start
+
+    # Time using JIT+scan
+    jitted_scan_fn = jax.jit(run_steps_with_scan, static_argnums=1)
+    # Warmup
+    _ = jitted_scan_fn(state, 100)
+
+    start = time.time()
+    state_jit = jitted_scan_fn(state, 100)
+    jax.block_until_ready(state_jit)
+    jitted_time = time.time() - start
+
+    print(f"Normal execution time: {normal_time:.4f}s")
+    print(f"Jitted+scan execution time: {jitted_time:.4f}s")
+    print(f"Speedup: {normal_time / jitted_time:.2f}x")
 
 
 if __name__ == "__main__":
