@@ -7,8 +7,12 @@ import equinox as eqx
 import numpy as np
 from tqdm import tqdm
 import mlflow
+import optax
 from catch_env import CatchEnvironment, CatchEnvironmentState
 from utils import tree_replace
+
+
+UNROLL_STEPS = 4
 
 
 class LinearQAgent(eqx.Module):
@@ -71,74 +75,122 @@ class LinearQAgent(eqx.Module):
         greedy_action = jnp.argmax(q_vals)
         
         return jnp.where(explore, random_action, greedy_action)
+
+
+def create_optimizer(
+    learning_rate: float,
+    momentum: float = 0.9,
+) -> optax.GradientTransformation:
+    """
+    Create an SGD optimizer with momentum.
     
-    def update(
-        self,
-        obs: jax.Array,
-        action: int,
-        reward: float,
-        next_obs: jax.Array,
-        gamma: float,
-        learning_rate: float,
-    ) -> Tuple['LinearQAgent', float]:
-        """
-        Update Q-values using Q-learning update rule.
+    Args:
+        learning_rate: Learning rate for the optimizer
+        momentum: Momentum coefficient (default: 0.9)
         
-        Q(s, a) ← Q(s, a) + α[r + γ max_a' Q(s', a') - Q(s, a)]
+    Returns:
+        Optax optimizer
+    """
+    return optax.sgd(learning_rate=learning_rate, momentum=momentum)
+
+
+def apply_gradients(
+    agent: LinearQAgent,
+    gradients: jax.Array,
+    optimizer_state: optax.OptState,
+    optimizer: optax.GradientTransformation,
+) -> Tuple[LinearQAgent, optax.OptState]:
+    """
+    Apply gradients to the agent using the optimizer.
+    
+    Args:
+        agent: Current agent
+        gradients: Gradients to apply, shape (num_actions, obs_dim)
+        optimizer_state: Current optimizer state
+        optimizer: Optax optimizer
         
-        Args:
-            obs: Current observation
-            action: Action taken
-            reward: Reward received
-            next_obs: Next observation
-            gamma: Discount factor
-            learning_rate: Learning rate (alpha)
-            
-        Returns:
-            Tuple of (updated agent, TD error squared as loss)
-        """
-        # Current Q-value
-        q_current = jnp.dot(self.weights[action], obs)
+    Returns:
+        Tuple of (updated agent, updated optimizer state)
+    """
+    # Compute updates from gradients
+    updates, new_optimizer_state = optimizer.update(
+        {'weights': gradients},
+        optimizer_state,
+    )
+    
+    # Apply updates to agent
+    new_weights = optax.apply_updates(
+        {'weights': agent.weights},
+        updates,
+    )['weights']
+    
+    updated_agent = tree_replace(agent, weights=new_weights)
+    
+    return updated_agent, new_optimizer_state
+
+
+def compute_gradients(
+    agent: LinearQAgent,
+    obs: jax.Array,
+    action: int,
+    reward: float,
+    next_obs: jax.Array,
+    gamma: float,
+) -> Tuple[jax.Array, float]:
+    """
+    Compute gradients for Q-learning update.
+    
+    Args:
+        agent: Current agent
+        obs: Current observation
+        action: Action taken
+        reward: Reward received
+        next_obs: Next observation
+        gamma: Discount factor
         
-        # Target Q-value
-        next_q_vals = self.q_values(next_obs)
-        q_target = reward + gamma * jnp.max(next_q_vals)
-        
-        # TD error
-        td_error = q_target - q_current
-        
-        # Update weights for the action taken
-        # ∇_w Q(s, a) = s, so update is: w[a] ← w[a] + α * td_error * s
-        weight_update = learning_rate * td_error * obs
-        
-        # Update the weights
-        new_weights = self.weights.at[action].add(weight_update)
-        
-        # Return updated agent and squared TD error as loss
-        loss = td_error ** 2
-        updated_agent = tree_replace(self, weights=new_weights)
-        
-        return updated_agent, loss
+    Returns:
+        Tuple of (gradients, TD error squared as loss)
+    """
+    # Current Q-value
+    q_current = jnp.dot(agent.weights[action], obs)
+    
+    # Target Q-value
+    next_q_vals = agent.q_values(next_obs)
+    q_target = reward + gamma * jnp.max(next_q_vals)
+    
+    # TD error
+    td_error = q_target - q_current
+    
+    # Loss is squared TD error
+    loss = td_error ** 2
+    
+    # Compute gradient: ∇_w Q(s, a) = s for action a
+    # Gradient is zero for all actions except the one taken
+    gradients = jnp.zeros_like(agent.weights)
+    gradients = gradients.at[action].set(-td_error * obs)
+    
+    return gradients, loss
 
 
 class TrainState(eqx.Module):
     """Training state for linear Q-learning."""
     # Static
-    learning_rate: float = eqx.field(static=True)
     gamma: float = eqx.field(static=True)
     epsilon: float = eqx.field(static=True)
     log_interval: int = eqx.field(static=True)
+    optimizer: optax.GradientTransformation = eqx.field(static=True)
     
     # Non-static
     agent: LinearQAgent
     env_state: CatchEnvironmentState
     rng: random.PRNGKey
+    optimizer_state: optax.OptState
     step: jax.Array = jnp.array(0)
 
 
 def create_train_state(
     env_state: CatchEnvironmentState,
-    learning_rate: float = 0.01,
+    optimizer: optax.GradientTransformation,
     gamma: float = 0.99,
     epsilon: float = 0.1,
     init_scale: float = 0.01,
@@ -150,7 +202,7 @@ def create_train_state(
     
     Args:
         env_state: Initial environment state
-        learning_rate: Learning rate for Q-learning
+        optimizer: Optax optimizer to use for training
         gamma: Discount factor
         epsilon: Exploration probability (constant)
         init_scale: Initial weight scale
@@ -173,18 +225,22 @@ def create_train_state(
     key, agent_key = random.split(key)
     agent = LinearQAgent(num_actions, obs_dim, agent_key, init_scale=init_scale)
     
+    # Initialize optimizer state
+    optimizer_state = optimizer.init({'weights': agent.weights})
+    
     # Reset environment
     key, reset_key = random.split(key)
     env_state, _ = CatchEnvironment.reset(env_state, reset_key)
     
     return TrainState(
-        learning_rate = learning_rate,
         gamma = gamma,
         epsilon = epsilon,
         log_interval = log_interval,
+        optimizer = optimizer,
         agent = agent,
         env_state = env_state,
         rng = key,
+        optimizer_state = optimizer_state,
     )
 
 
@@ -212,23 +268,32 @@ def train_step(train_state: TrainState) -> Tuple[TrainState, dict]:
         action,
     )
     
-    # Update agent
-    agent, loss = train_state.agent.update(
+    # Compute gradients
+    gradients, loss = compute_gradients(
+        agent = train_state.agent,
         obs = obs,
         action = action,
         reward = reward,
         next_obs = next_obs,
         gamma = train_state.gamma,
-        learning_rate = train_state.learning_rate,
+    )
+    
+    # Apply gradients
+    updated_agent, new_optimizer_state = apply_gradients(
+        agent = train_state.agent,
+        gradients = gradients,
+        optimizer_state = train_state.optimizer_state,
+        optimizer = train_state.optimizer,
     )
     
     # Update train state
     new_train_state = tree_replace(
         train_state,
-        agent = agent,
+        agent = updated_agent,
         env_state = new_env_state,
         step = train_state.step + 1,
         rng = key,
+        optimizer_state = new_optimizer_state,
     )
     
     # Compute metrics
@@ -254,24 +319,6 @@ def train_linear_q(
     Returns:
         Trained train state
     """
-    # Start MLFlow run
-    mlflow.start_run()
-    
-    # Log hyperparameters
-    mlflow.log_params({
-        'learning_rate': train_state.learning_rate,
-        'gamma': train_state.gamma,
-        'epsilon': train_state.epsilon,
-        'num_steps': num_steps,
-        'log_interval': train_state.log_interval,
-        'obs_dim': CatchEnvironment.observation_space_size(train_state.env_state),
-        'num_actions': CatchEnvironment.action_space_size(train_state.env_state),
-        'env_rows': train_state.env_state.rows,
-        'env_cols': train_state.env_state.cols,
-        'env_hot_prob': train_state.env_state.hot_prob,
-        'env_reset_prob': train_state.env_state.reset_prob,
-    })
-    
     # Calculate number of scan iterations
     log_interval = train_state.log_interval
     num_scans = num_steps // log_interval
@@ -282,6 +329,7 @@ def train_linear_q(
             lambda state, _: train_step(state),
             train_state,
             length = log_interval,
+            unroll = UNROLL_STEPS,
         )
         return train_state, metrics
     
@@ -310,7 +358,6 @@ def train_linear_q(
         }, step=train_state.step.item())
     
     pbar.close()
-    mlflow.end_run()
     
     return train_state
 
@@ -326,12 +373,20 @@ def main():
                         help='Random seed (default: 42)')
     parser.add_argument('--learning_rate', type=float, default=0.01,
                         help='Learning rate (default: 0.01)')
+    parser.add_argument('--momentum', type=float, default=0.0,
+                        help='Momentum coefficient for SGD (default: 0.99)')
     parser.add_argument('--log_interval', type=int, default=10_000,
                         help='Logging interval in steps (default: 10000)')
     parser.add_argument('--num_steps', type=int, default=1_000_000,
                         help='Total number of training steps (default: 1000000)')
     
     args = parser.parse_args()
+    
+    # Create optimizer
+    optimizer = create_optimizer(
+        learning_rate = args.learning_rate,
+        momentum = args.momentum,
+    )
     
     # Create environment
     env_state = CatchEnvironmentState(
@@ -345,12 +400,29 @@ def main():
     # Create training state
     train_state = create_train_state(
         env_state = env_state,
-        learning_rate = args.learning_rate,
+        optimizer = optimizer,
         gamma = args.gamma,
         epsilon = args.epsilon,
         seed = args.seed,
         log_interval = args.log_interval,
     )
+    
+    # Start MLFlow run and log hyperparameters
+    mlflow.start_run()
+    mlflow.log_params({
+        'learning_rate': args.learning_rate,
+        'momentum': args.momentum,
+        'gamma': train_state.gamma,
+        'epsilon': train_state.epsilon,
+        'num_steps': args.num_steps,
+        'log_interval': train_state.log_interval,
+        'obs_dim': CatchEnvironment.observation_space_size(train_state.env_state),
+        'num_actions': CatchEnvironment.action_space_size(train_state.env_state),
+        'env_rows': train_state.env_state.rows,
+        'env_cols': train_state.env_state.cols,
+        'env_hot_prob': train_state.env_state.hot_prob,
+        'env_reset_prob': train_state.env_state.reset_prob,
+    })
     
     # Train agent
     train_state = train_linear_q(
@@ -358,6 +430,7 @@ def main():
         num_steps = args.num_steps,
     )
     
+    mlflow.end_run()
     print('Training complete!')
 
 
