@@ -304,7 +304,7 @@ class CatchEnvironment(eqx.Module):
             "reward_countdown": reward_countdown,
         }
         
-        return new_state, observation, reward, info
+        return new_state, jax.lax.stop_gradient(observation), jax.lax.stop_gradient(reward), info
     
     @staticmethod
     def reset(state: CatchEnvironmentState, key: Optional[random.PRNGKey] = None) -> Tuple[CatchEnvironmentState, jax.Array]:

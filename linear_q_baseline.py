@@ -70,7 +70,7 @@ class LinearQAgent(eqx.Module):
         # Greedy action
         greedy_action = jnp.argmax(q_vals)
         
-        return jnp.where(explore, random_action, greedy_action).item()
+        return jnp.where(explore, random_action, greedy_action)
     
     def update(
         self,
@@ -115,7 +115,7 @@ class LinearQAgent(eqx.Module):
         new_weights = self.weights.at[action].add(weight_update)
         
         # Return updated agent and squared TD error as loss
-        loss = float(td_error ** 2)
+        loss = td_error ** 2
         updated_agent = tree_replace(self, weights=new_weights)
         
         return updated_agent, loss
@@ -132,10 +132,8 @@ class TrainState(eqx.Module):
     # Non-static
     agent: LinearQAgent
     env_state: CatchEnvironmentState
-    step: jax.Array
-    cumulative_reward: jax.Array
-    cumulative_loss: jax.Array
     rng: random.PRNGKey
+    step: jax.Array = jnp.array(0)
 
 
 def create_train_state(
@@ -180,16 +178,13 @@ def create_train_state(
     env_state, _ = CatchEnvironment.reset(env_state, reset_key)
     
     return TrainState(
-        learning_rate=learning_rate,
-        gamma=gamma,
-        epsilon=epsilon,
-        log_interval=log_interval,
-        agent=agent,
-        env_state=env_state,
-        step=jnp.array(0),
-        cumulative_reward=jnp.array(0.0),
-        cumulative_loss=jnp.array(0.0),
-        rng=key,
+        learning_rate = learning_rate,
+        gamma = gamma,
+        epsilon = epsilon,
+        log_interval = log_interval,
+        agent = agent,
+        env_state = env_state,
+        rng = key,
     )
 
 
@@ -206,13 +201,12 @@ def train_step(train_state: TrainState) -> Tuple[TrainState, dict]:
     # Select action
     key, action_key = random.split(train_state.rng)
     action = train_state.agent.select_action(
-        obs,
-        train_state.epsilon,
-        action_key,
+        observation = obs,
+        epsilon = train_state.epsilon,
+        key = action_key,
     )
     
     # Take step
-    key, step_key = random.split(key)
     new_env_state, next_obs, reward, info = CatchEnvironment.step(
         train_state.env_state,
         action,
@@ -220,30 +214,27 @@ def train_step(train_state: TrainState) -> Tuple[TrainState, dict]:
     
     # Update agent
     agent, loss = train_state.agent.update(
-        obs=obs,
-        action=action,
-        reward=reward.item(),
-        next_obs=next_obs,
-        gamma=train_state.gamma,
-        learning_rate=train_state.learning_rate,
+        obs = obs,
+        action = action,
+        reward = reward,
+        next_obs = next_obs,
+        gamma = train_state.gamma,
+        learning_rate = train_state.learning_rate,
     )
     
     # Update train state
     new_train_state = tree_replace(
         train_state,
-        agent=agent,
-        env_state=new_env_state,
-        step=train_state.step + 1,
-        cumulative_reward=train_state.cumulative_reward + reward,
-        cumulative_loss=train_state.cumulative_loss + jnp.array(loss),
-        rng=key,
+        agent = agent,
+        env_state = new_env_state,
+        step = train_state.step + 1,
+        rng = key,
     )
     
     # Compute metrics
     metrics = {
-        'reward': float(reward.item()),
+        'reward': reward,
         'loss': loss,
-        'epsilon': train_state.epsilon,
     }
     
     return new_train_state, metrics
@@ -281,58 +272,44 @@ def train_linear_q(
         'env_reset_prob': train_state.env_state.reset_prob,
     })
     
-    # Track metrics for averaging
-    reward_window = []
-    loss_window = []
+    # Calculate number of scan iterations
+    log_interval = train_state.log_interval
+    num_scans = num_steps // log_interval
+    
+    @jax.jit
+    def multi_step_train(train_state: TrainState) -> Tuple[TrainState, dict]:
+        train_state, metrics = jax.lax.scan(
+            lambda state, _: train_step(state),
+            train_state,
+            length = log_interval,
+        )
+        return train_state, metrics
     
     # Progress bar
-    pbar = tqdm(range(num_steps), desc='Training')
+    pbar = tqdm(total=num_steps, desc='Training')
     
-    for _ in pbar:
-        train_state, metrics = train_step(train_state)
+    # Run full batch iterations
+    for _ in range(num_scans):
+        train_state, metrics = multi_step_train(train_state)
         
-        reward_window.append(metrics['reward'])
-        loss_window.append(metrics['loss'])
-        
-        # Keep window size manageable
-        if len(reward_window) > train_state.log_interval:
-            reward_window.pop(0)
-            loss_window.pop(0)
+        # Average metrics
+        avg_reward = metrics['reward'].mean()
+        avg_loss = metrics['loss'].mean()
         
         # Update progress bar
-        avg_reward = np.mean(reward_window) if reward_window else 0.0
-        avg_loss = np.mean(loss_window) if loss_window else 0.0
-        reward_rate = train_state.cumulative_reward.item() / max(train_state.step.item(), 1)
-        
+        pbar.update(log_interval)
         pbar.set_postfix({
-            'reward': f'{metrics["reward"]:.2f}',
             'avg_reward': f'{avg_reward:.2f}',
-            'reward_rate': f'{reward_rate:.4f}',
-            'loss': f'{avg_loss:.4f}',
-            'epsilon': f'{metrics["epsilon"]:.3f}',
+            'avg_loss': f'{avg_loss:.4f}',
         })
         
         # Log to MLFlow
-        if train_state.step.item() % train_state.log_interval == 0:
-            mlflow.log_metrics({
-                'reward': metrics['reward'],
-                'avg_reward': avg_reward,
-                'reward_rate': reward_rate,
-                'loss': avg_loss,
-                'epsilon': metrics['epsilon'],
-                'cumulative_reward': train_state.cumulative_reward.item(),
-                'cumulative_loss': train_state.cumulative_loss.item(),
-            }, step=train_state.step.item())
+        mlflow.log_metrics({
+            'avg_reward': avg_reward,
+            'avg_loss': avg_loss,
+        }, step=train_state.step.item())
     
-    # Log final metrics
-    final_reward_rate = train_state.cumulative_reward.item() / max(train_state.step.item(), 1)
-    final_avg_loss = train_state.cumulative_loss.item() / max(train_state.step.item(), 1)
-    mlflow.log_metrics({
-        'final_reward_rate': final_reward_rate,
-        'final_avg_loss': final_avg_loss,
-        'final_cumulative_reward': train_state.cumulative_reward.item(),
-    })
-    
+    pbar.close()
     mlflow.end_run()
     
     return train_state
@@ -349,36 +326,36 @@ def main():
                         help='Random seed (default: 42)')
     parser.add_argument('--learning_rate', type=float, default=0.01,
                         help='Learning rate (default: 0.01)')
-    parser.add_argument('--log_interval', type=int, default=100,
-                        help='Logging interval in steps (default: 100)')
-    parser.add_argument('--num_steps', type=int, default=100000,
-                        help='Total number of training steps (default: 100000)')
+    parser.add_argument('--log_interval', type=int, default=10_000,
+                        help='Logging interval in steps (default: 10000)')
+    parser.add_argument('--num_steps', type=int, default=1_000_000,
+                        help='Total number of training steps (default: 1000000)')
     
     args = parser.parse_args()
     
     # Create environment
     env_state = CatchEnvironmentState(
-        rows=10,
-        cols=5,
-        hot_prob=1.0,
-        reset_prob=1.0,
-        seed=args.seed,
+        rows = 10,
+        cols = 5,
+        hot_prob = 1.0,
+        reset_prob = 1.0,
+        seed = args.seed,
     )
     
     # Create training state
     train_state = create_train_state(
-        env_state=env_state,
-        learning_rate=args.learning_rate,
-        gamma=args.gamma,
-        epsilon=args.epsilon,
-        seed=args.seed,
-        log_interval=args.log_interval,
+        env_state = env_state,
+        learning_rate = args.learning_rate,
+        gamma = args.gamma,
+        epsilon = args.epsilon,
+        seed = args.seed,
+        log_interval = args.log_interval,
     )
     
     # Train agent
     train_state = train_linear_q(
-        train_state=train_state,
-        num_steps=args.num_steps,
+        train_state = train_state,
+        num_steps = args.num_steps,
     )
     
     print('Training complete!')
