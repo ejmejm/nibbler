@@ -1,1 +1,3 @@
 *.gif
+*.db
+**/__pycache__/
