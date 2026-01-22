@@ -1,14 +1,17 @@
-from typing import Optional, Tuple, List, Any
 import argparse
+from functools import partial
+from typing import Optional, Tuple, List, Any
+
+import equinox as eqx
+import equinox.nn as nn
 import jax
 import jax.numpy as jnp
 from jax import random
-import equinox as eqx
-import equinox.nn as nn
-import numpy as np
-from tqdm import tqdm
 import mlflow
+import numpy as np
 import optax
+from tqdm import tqdm
+
 from catch_env import CatchEnvironment, CatchEnvironmentState
 from utils import configure_jax_config, tree_replace
 
@@ -229,6 +232,7 @@ def create_train_state(
     hidden_dims: Optional[List[int]] = None,
     seed: Optional[int] = None,
     log_interval: int = 100,
+    num_envs: int = 1,
 ) -> TrainState:
     """
     Create and initialize training state.
@@ -241,6 +245,7 @@ def create_train_state(
         hidden_dims: List of hidden layer dimensions. If None or empty, network is linear.
         seed: Random seed
         log_interval: Interval for logging metrics to MLFlow
+        num_envs: Number of environments
         
     Returns:
         Initialized TrainState
@@ -257,8 +262,8 @@ def create_train_state(
     # Initialize agent
     key, agent_key = random.split(key)
     agent = DeepQAgent(
-        num_actions = num_actions,
-        obs_dim = obs_dim,
+        num_actions = num_actions * num_envs,
+        obs_dim = obs_dim * num_envs,
         hidden_dims = hidden_dims,
         key = agent_key,
     )
@@ -294,7 +299,7 @@ def train_step(train_state: TrainState) -> Tuple[TrainState, dict]:
         Tuple of (updated train_state, metrics dict)
     """
     # Get current observation
-    obs = CatchEnvironment._get_observation(train_state.env_state)
+    obs = jax.vmap(CatchEnvironment._get_observation, in_axes=0)(train_state.env_state)
     
     # Select action
     key, action_key = random.split(train_state.rng)
@@ -423,9 +428,18 @@ def main():
                         help='Logging interval in steps (default: 10000)')
     parser.add_argument('--num_steps', type=int, default=1_000_000,
                         help='Total number of training steps (default: 1000000)')
+    parser.add_argument('--num_envs', type=int, default=2,
+                        help='Total number of environments (default: 2)')
     
     args = parser.parse_args()
     configure_jax_config()
+    
+    key = (
+        jax.random.PRNGKey(args.seed) if args.seed is not None
+        else jax.random.PRNGKey(np.random.randint(0, 1_000_000_000))
+    )
+    seeds = jax.random.randint(key, (args.num_envs + 1,), 0, 1_000_000_000)
+    env_seeds, train_state_seed = seeds[:args.num_envs], seeds[args.num_envs]
     
     # Create optimizer
     optimizer = create_optimizer(
@@ -434,13 +448,17 @@ def main():
     )
     
     # Create environment
-    env_state = CatchEnvironmentState(
-        rows = 10,
-        cols = 5,
-        hot_prob = 1.0,
-        reset_prob = 1.0,
-        seed = args.seed,
-    )
+    env_state = jax.vmap(
+        partial(CatchEnvironmentState,
+            rows = 10,
+            cols = 5,
+            hot_prob = 1.0,
+            reset_prob = 1.0,
+            reward_indicator_duration_min = 1,
+            reward_indicator_duration_max = 3,
+        ),
+        in_axes = 0,
+    )(seed = env_seeds)
     
     # Create training state
     train_state = create_train_state(
@@ -449,8 +467,9 @@ def main():
         gamma = args.gamma,
         epsilon = args.epsilon,
         hidden_dims = args.hidden_dims,
-        seed = args.seed,
+        seed = train_state_seed,
         log_interval = args.log_interval,
+        num_envs = args.num_envs,
     )
     
     # Start MLFlow run and log hyperparameters
