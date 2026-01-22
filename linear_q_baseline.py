@@ -10,7 +10,7 @@ from tqdm import tqdm
 import mlflow
 import optax
 from catch_env import CatchEnvironment, CatchEnvironmentState
-from utils import tree_replace
+from utils import configure_jax_config, tree_replace
 
 
 UNROLL_STEPS = 4
@@ -343,6 +343,7 @@ def run_experiment():
                         help='Total number of training steps (default: 1000000)')
     
     args = parser.parse_args()
+    configure_jax_config()
     
     # Create optimizer
     optimizer = create_optimizer(
@@ -371,20 +372,8 @@ def run_experiment():
     
     # Start MLFlow run and log hyperparameters
     mlflow.start_run()
-    mlflow.log_params({
-        'learning_rate': args.learning_rate,
-        'momentum': args.momentum,
-        'gamma': train_state.gamma,
-        'epsilon': train_state.epsilon,
-        'num_steps': args.num_steps,
-        'log_interval': train_state.log_interval,
-        'obs_dim': CatchEnvironment.observation_space_size(train_state.env_state),
-        'num_actions': CatchEnvironment.action_space_size(train_state.env_state),
-        'env_rows': train_state.env_state.rows,
-        'env_cols': train_state.env_state.cols,
-        'env_hot_prob': train_state.env_state.hot_prob,
-        'env_reset_prob': train_state.env_state.reset_prob,
-    })
+    args_dict = vars(args)
+    mlflow.log_params(args_dict)
     
     # Train agent
     train_state = train_linear_q(
