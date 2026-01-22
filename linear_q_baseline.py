@@ -1,9 +1,10 @@
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Any
 import argparse
 import jax
 import jax.numpy as jnp
 from jax import random
 import equinox as eqx
+import equinox.nn as nn
 import numpy as np
 from tqdm import tqdm
 import mlflow
@@ -20,18 +21,17 @@ class LinearQAgent(eqx.Module):
     Linear Q-learning agent using linear function approximation.
     Q(s, a) = W[a, :]^T * s
     """
-    weights: jax.Array  # Shape: (num_actions, obs_dim)
+    layer: nn.Linear
     
     def __init__(
         self,
         num_actions: int,
         obs_dim: int,
         key: random.PRNGKey,
-        init_scale: float = 0.01,
     ):
         """Initialize the linear Q-learning agent."""
-        # Initialize weights with small random values
-        self.weights = random.normal(key, (num_actions, obs_dim)) * init_scale
+        # Create a linear layer: obs_dim -> num_actions, no bias
+        self.layer = nn.Linear(obs_dim, num_actions, use_bias=False, key=key)
     
     def q_values(self, observation: jax.Array) -> jax.Array:
         """
@@ -43,7 +43,7 @@ class LinearQAgent(eqx.Module):
         Returns:
             Q-values for all actions, shape (num_actions,)
         """
-        return jnp.dot(self.weights, observation)
+        return self.layer(observation)
     
     def select_action(
         self,
@@ -63,13 +63,14 @@ class LinearQAgent(eqx.Module):
             Selected action index
         """
         q_vals = self.q_values(observation)
+        num_actions = q_vals.shape[0]
         
         # Epsilon-greedy: random with prob epsilon, greedy otherwise
         key1, key2 = random.split(key)
         explore = random.uniform(key1) < epsilon
         
         # Random action
-        random_action = random.randint(key2, (), 0, self.weights.shape[0])
+        random_action = random.randint(key2, (), 0, num_actions)
         
         # Greedy action
         greedy_action = jnp.argmax(q_vals)
@@ -81,52 +82,7 @@ def create_optimizer(
     learning_rate: float,
     momentum: float = 0.9,
 ) -> optax.GradientTransformation:
-    """
-    Create an SGD optimizer with momentum.
-    
-    Args:
-        learning_rate: Learning rate for the optimizer
-        momentum: Momentum coefficient (default: 0.9)
-        
-    Returns:
-        Optax optimizer
-    """
     return optax.sgd(learning_rate=learning_rate, momentum=momentum)
-
-
-def apply_gradients(
-    agent: LinearQAgent,
-    gradients: jax.Array,
-    optimizer_state: optax.OptState,
-    optimizer: optax.GradientTransformation,
-) -> Tuple[LinearQAgent, optax.OptState]:
-    """
-    Apply gradients to the agent using the optimizer.
-    
-    Args:
-        agent: Current agent
-        gradients: Gradients to apply, shape (num_actions, obs_dim)
-        optimizer_state: Current optimizer state
-        optimizer: Optax optimizer
-        
-    Returns:
-        Tuple of (updated agent, updated optimizer state)
-    """
-    # Compute updates from gradients
-    updates, new_optimizer_state = optimizer.update(
-        {'weights': gradients},
-        optimizer_state,
-    )
-    
-    # Apply updates to agent
-    new_weights = optax.apply_updates(
-        {'weights': agent.weights},
-        updates,
-    )['weights']
-    
-    updated_agent = tree_replace(agent, weights=new_weights)
-    
-    return updated_agent, new_optimizer_state
 
 
 def compute_gradients(
@@ -136,7 +92,7 @@ def compute_gradients(
     reward: float,
     next_obs: jax.Array,
     gamma: float,
-) -> Tuple[jax.Array, float]:
+) -> Tuple[Any, float]:
     """
     Compute gradients for Q-learning update.
     
@@ -151,23 +107,23 @@ def compute_gradients(
     Returns:
         Tuple of (gradients, TD error squared as loss)
     """
-    # Current Q-value
-    q_current = jnp.dot(agent.weights[action], obs)
+    def loss_fn(agent: LinearQAgent) -> jax.Array:
+        # Current Q-value for the action taken
+        q_vals = agent.q_values(obs)
+        q_current = q_vals[action]
+        
+        # Target Q-value (using stop_gradient to prevent gradients from flowing through target)
+        next_q_vals = jax.lax.stop_gradient(agent.q_values(next_obs))
+        q_target = reward + gamma * jnp.max(next_q_vals)
+        
+        # TD error
+        td_error = q_target - q_current
+        
+        # Loss is squared TD error
+        return td_error ** 2
     
-    # Target Q-value
-    next_q_vals = agent.q_values(next_obs)
-    q_target = reward + gamma * jnp.max(next_q_vals)
-    
-    # TD error
-    td_error = q_target - q_current
-    
-    # Loss is squared TD error
-    loss = td_error ** 2
-    
-    # Compute gradient: ∇_w Q(s, a) = s for action a
-    # Gradient is zero for all actions except the one taken
-    gradients = jnp.zeros_like(agent.weights)
-    gradients = gradients.at[action].set(-td_error * obs)
+    # Compute gradients using automatic differentiation
+    loss, gradients = eqx.filter_value_and_grad(loss_fn)(agent)
     
     return gradients, loss
 
@@ -193,7 +149,6 @@ def create_train_state(
     optimizer: optax.GradientTransformation,
     gamma: float = 0.99,
     epsilon: float = 0.1,
-    init_scale: float = 0.01,
     seed: Optional[int] = None,
     log_interval: int = 100,
 ) -> TrainState:
@@ -205,7 +160,6 @@ def create_train_state(
         optimizer: Optax optimizer to use for training
         gamma: Discount factor
         epsilon: Exploration probability (constant)
-        init_scale: Initial weight scale
         seed: Random seed
         log_interval: Interval for logging metrics to MLFlow
         
@@ -223,10 +177,14 @@ def create_train_state(
     
     # Initialize agent
     key, agent_key = random.split(key)
-    agent = LinearQAgent(num_actions, obs_dim, agent_key, init_scale=init_scale)
+    agent = LinearQAgent(num_actions, obs_dim, agent_key)
     
     # Initialize optimizer state
-    optimizer_state = optimizer.init({'weights': agent.weights})
+    # Compute a dummy gradient to get the structure
+    def dummy_loss(agent):
+        return 0.0
+    _, dummy_grads = eqx.filter_value_and_grad(dummy_loss)(agent)
+    optimizer_state = optimizer.init(dummy_grads)
     
     # Reset environment
     key, reset_key = random.split(key)
@@ -278,13 +236,12 @@ def train_step(train_state: TrainState) -> Tuple[TrainState, dict]:
         gamma = train_state.gamma,
     )
     
-    # Apply gradients
-    updated_agent, new_optimizer_state = apply_gradients(
-        agent = train_state.agent,
-        gradients = gradients,
-        optimizer_state = train_state.optimizer_state,
-        optimizer = train_state.optimizer,
+    # Apply gradients using optax directly
+    updates, new_optimizer_state = train_state.optimizer.update(
+        gradients,
+        train_state.optimizer_state,
     )
+    updated_agent = eqx.apply_updates(train_state.agent, updates)
     
     # Update train state
     new_train_state = tree_replace(
@@ -362,7 +319,7 @@ def train_linear_q(
     return train_state
 
 
-def main():
+def run_experiment():
     """Main training script."""
     parser = argparse.ArgumentParser(description='Train linear Q-learning agent')
     parser.add_argument('--epsilon', type=float, default=0.1,
@@ -435,4 +392,4 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    run_experiment()
