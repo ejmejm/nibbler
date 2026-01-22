@@ -17,6 +17,7 @@ class CatchEnvironmentState(eqx.Module):
     reset_prob: float
     reward_indicator_duration_min: int
     reward_indicator_duration_max: int
+    paddle_noise: float
     
     # Dynamic parameters (state)
     rng: random.PRNGKey
@@ -39,6 +40,7 @@ class CatchEnvironmentState(eqx.Module):
         reset_prob: float = 0.2,
         reward_indicator_duration_min: int = 1,
         reward_indicator_duration_max: int = 3,
+        paddle_noise: float = 0.0,
         seed: Optional[int] = None,
     ):
         """Initialize the Catch environment state with the given parameters."""
@@ -51,6 +53,7 @@ class CatchEnvironmentState(eqx.Module):
         self.reset_prob = reset_prob
         self.reward_indicator_duration_min = reward_indicator_duration_min
         self.reward_indicator_duration_max = reward_indicator_duration_max
+        self.paddle_noise = paddle_noise
         
         # Set up RNG
         if seed is None:
@@ -130,10 +133,18 @@ class CatchEnvironment(eqx.Module):
         Returns:
             Tuple of (new_state, observation, reward, info)
         """
-        # Update paddle position based on action
+        # Apply paddle noise: with probability paddle_noise, replace action with random action
+        key, subkey_noise = random.split(state.rng)
+        subkey_noise, subkey_action = random.split(subkey_noise)
+        noise_sample = random.uniform(subkey_noise)
+        should_apply_noise = noise_sample < state.paddle_noise
+        random_action = random.randint(subkey_action, (), 0, 3)
+        effective_action = jnp.where(should_apply_noise, random_action, action)
+        
+        # Update paddle position based on effective action
         # 0: left, 1: stay, 2: right
         paddle_col = jnp.clip(
-            state.paddle_col + jnp.array([-1, 0, 1])[action],
+            state.paddle_col + jnp.array([-1, 0, 1])[effective_action],
             0,
             state.cols - 1,
         )
@@ -174,7 +185,7 @@ class CatchEnvironment(eqx.Module):
         should_activate_reset_from_catch_miss = (catch_was_active | miss_was_active) & ~is_hot
         
         # Generate random duration for plus/minus if needed
-        key, subkey4 = random.split(state.rng)
+        key, subkey4 = random.split(key)
         duration = random.randint(
             subkey4, 
             (), 
@@ -322,6 +333,7 @@ class CatchEnvironment(eqx.Module):
             reset_prob=state.reset_prob,
             reward_indicator_duration_min=state.reward_indicator_duration_min,
             reward_indicator_duration_max=state.reward_indicator_duration_max,
+            paddle_noise=state.paddle_noise,
             seed=random.randint(subkey, (), 0, 1000000000).item()
         )
         

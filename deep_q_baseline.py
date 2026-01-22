@@ -454,6 +454,7 @@ def main():
             cols = 5,
             hot_prob = 1.0,
             reset_prob = 1.0,
+            paddle_noise = 0.2,
             reward_indicator_duration_min = 1,
             reward_indicator_duration_max = 3,
         ),
