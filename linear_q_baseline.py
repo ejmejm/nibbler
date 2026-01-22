@@ -82,7 +82,12 @@ def create_optimizer(
     learning_rate: float,
     momentum: float = 0.9,
 ) -> optax.GradientTransformation:
-    return optax.sgd(learning_rate=learning_rate, momentum=momentum)
+    """SGD optimizer with EMA-style momentum."""
+    return optax.chain(
+        optax.trace(decay=momentum, nesterov=False),
+        optax.scale(1.0 - momentum),
+        optax.scale(-learning_rate),
+    )
 
 
 def compute_gradients(
@@ -326,12 +331,12 @@ def run_experiment():
                         help='Exploration probability (default: 0.1)')
     parser.add_argument('--gamma', type=float, default=0.99,
                         help='Discount factor (default: 0.99)')
-    parser.add_argument('--seed', type=int, default=42,
-                        help='Random seed (default: 42)')
+    parser.add_argument('--seed', type=int, default=None,
+                        help='Random seed (default: None)')
     parser.add_argument('--learning_rate', type=float, default=0.01,
                         help='Learning rate (default: 0.01)')
     parser.add_argument('--momentum', type=float, default=0.0,
-                        help='Momentum coefficient for SGD (default: 0.99)')
+                        help='Momentum coefficient for SGD (default: 0.0)')
     parser.add_argument('--log_interval', type=int, default=10_000,
                         help='Logging interval in steps (default: 10000)')
     parser.add_argument('--num_steps', type=int, default=1_000_000,
