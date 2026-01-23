@@ -1,47 +1,40 @@
-from typing import Optional, List
+from typing import Any, List, Optional, Tuple
 
 import equinox as eqx
 import equinox.nn as nn
 import jax
 import jax.numpy as jnp
 from jax import random
+from jaxtyping import Array, Float
 
 
-class DeepQNetwork(eqx.Module):
-    """
-    Deep Q-learning agent with configurable hidden layers.
-    If hidden_dims is empty, the network is linear: obs_dim -> num_actions
-    """
+class MLP(eqx.Module):
+    """Multi-layer perceptron with configurable hidden layers and activation function."""
     layers: List[nn.Linear]
+    activation: Any = eqx.field(static=True)
     
     def __init__(
         self,
-        num_actions: int,
-        obs_dim: int,
+        input_dim: int,
+        output_dim: int,
         hidden_dims: Optional[List[int]] = None,
+        activation: Any = jax.nn.relu,
+        use_bias: bool = False,
         key: random.PRNGKey = None,
     ):
-        """
-        Initialize the deep Q-learning agent.
-        
-        Args:
-            num_actions: Number of actions
-            obs_dim: Observation dimension
-            hidden_dims: List of hidden layer dimensions. If None or empty, network is linear.
-            key: Random key for initialization
-        """
         if hidden_dims is None:
             hidden_dims = []
         
+        self.activation = activation
         self.layers = []
         
         # Build layer dimensions
         if len(hidden_dims) == 0:
-            # Linear network: obs_dim -> num_actions
-            dims = [obs_dim, num_actions]
+            # Linear network: input_dim -> output_dim
+            dims = [input_dim, output_dim]
         else:
-            # Deep network: obs_dim -> hidden_dims -> num_actions
-            dims = [obs_dim] + hidden_dims + [num_actions]
+            # Deep network: input_dim -> hidden_dims -> output_dim
+            dims = [input_dim] + hidden_dims + [output_dim]
         
         # Split keys for each layer
         if len(dims) == 2:
@@ -54,33 +47,48 @@ class DeepQNetwork(eqx.Module):
             layer = nn.Linear(
                 dims[i],
                 dims[i + 1],
-                use_bias = False,
+                use_bias = use_bias,
                 key = keys[i],
             )
             self.layers.append(layer)
     
-    def q_values(self, observation: jax.Array) -> jax.Array:
-        """
-        Compute Q-values for all actions given an observation.
-        
-        Args:
-            observation: Observation vector of shape (obs_dim,)
-            
-        Returns:
-            Q-values for all actions, shape (num_actions,)
-        """
-        x = observation
+    def __call__(self, x: Float[Array, 'input_dim']) -> Float[Array, 'output_dim']:
         # Forward through all layers except the last
         for layer in self.layers[:-1]:
             x = layer(x)
-            x = jax.nn.relu(x)
-        # Last layer (no activation)
+            x = self.activation(x)
         x = self.layers[-1](x)
         return x
+
+
+class DeepQNetwork(eqx.Module):
+    """Deep Q-learning agent with configurable hidden layers."""
+    mlp: MLP
+    
+    def __init__(
+        self,
+        num_actions: int,
+        obs_dim: int,
+        hidden_dims: Optional[List[int]] = None,
+        key: random.PRNGKey = None,
+    ):
+        """Initialize the deep Q-learning agent."""
+        self.mlp = MLP(
+            input_dim = obs_dim,
+            output_dim = num_actions,
+            hidden_dims = hidden_dims,
+            activation = jax.nn.relu,
+            use_bias = False,
+            key = key,
+        )
+    
+    def q_values(self, observation: Float[Array, 'obs_dim']) -> Float[Array, 'num_actions']:
+        """Compute Q-values for all actions given an observation."""
+        return self.mlp(observation)
     
     def select_action(
         self,
-        observation: jax.Array,
+        observation: Float[Array, 'obs_dim'],
         epsilon: float,
         key: random.PRNGKey,
     ) -> int:
@@ -109,3 +117,88 @@ class DeepQNetwork(eqx.Module):
         greedy_action = jnp.argmax(q_vals)
         
         return jnp.where(explore, random_action, greedy_action)
+
+
+class QVNetwork(eqx.Module):
+    """QV network with shared and separate hidden layers."""
+    shared_mlp: Optional[MLP]
+    q_separate_mlp: MLP
+    v_separate_mlp: MLP
+    
+    def __init__(
+        self,
+        n_actions: int,
+        input_dim: int,
+        shared_hidden_dims: Optional[List[int]] = None,
+        separate_hidden_dims: Optional[List[int]] = None,
+        activation: Any = jax.nn.relu,
+        use_bias: bool = False,
+        key: random.PRNGKey = None,
+    ):
+        if shared_hidden_dims is None:
+            shared_hidden_dims = []
+        if separate_hidden_dims is None:
+            separate_hidden_dims = []
+        
+        # Determine shared output dimension
+        if len(shared_hidden_dims) == 0:
+            shared_output_dim = input_dim
+            # No shared layers needed - will use identity in _compute_shared_representation
+            self.shared_mlp = None
+        else:
+            shared_output_dim = shared_hidden_dims[-1]
+            # Split keys for the three MLPs
+            key, shared_key, q_key, v_key = random.split(key, 4)
+            # Create shared MLP
+            self.shared_mlp = MLP(
+                input_dim = input_dim,
+                output_dim = shared_output_dim,
+                hidden_dims = shared_hidden_dims,
+                activation = activation,
+                use_bias = use_bias,
+                key = shared_key,
+            )
+        
+        # Split keys for separate MLPs (if shared_mlp was created, keys already split)
+        if self.shared_mlp is None:
+            key, q_key, v_key = random.split(key, 3)
+        
+        # Create Q separate MLP
+        self.q_separate_mlp = MLP(
+            input_dim = shared_output_dim,
+            output_dim = n_actions,
+            hidden_dims = separate_hidden_dims,
+            activation = activation,
+            use_bias = use_bias,
+            key = q_key,
+        )
+        
+        # Create V separate MLP
+        self.v_separate_mlp = MLP(
+            input_dim = shared_output_dim,
+            output_dim = 1,
+            hidden_dims = separate_hidden_dims,
+            activation = activation,
+            use_bias = use_bias,
+            key = v_key,
+        )
+    
+    def compute_shared_representation(self, observation: Float[Array, 'input_dim']) -> Float[Array, 'shared_dim']:
+        """Compute shared representation from observation."""
+        if self.shared_mlp is None:
+            return observation
+        return self.shared_mlp(observation)
+    
+    def action_values(self, observation: Float[Array, 'input_dim']) -> Float[Array, 'n_actions']:
+        shared_repr = self.compute_shared_representation(observation)
+        return self.q_separate_mlp(shared_repr)
+    
+    def state_value(self, observation: Float[Array, 'input_dim']) -> Float[Array, '1']:
+        shared_repr = self.compute_shared_representation(observation)
+        return self.v_separate_mlp(shared_repr)
+    
+    def action_and_state_values(self, observation: Float[Array, 'input_dim']) -> Tuple[Float[Array, 'n_actions'], Float[Array, '1']]:
+        shared_repr = self.compute_shared_representation(observation)
+        q_values = self.q_separate_mlp(shared_repr)
+        state_val = self.v_separate_mlp(shared_repr)
+        return q_values, state_val
