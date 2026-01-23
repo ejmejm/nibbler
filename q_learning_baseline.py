@@ -65,49 +65,6 @@ def apply_gradients(
     return updated_agent, new_optimizer_state
 
 
-def compute_gradients(
-    agent: DeepQNetwork,
-    obs: jax.Array,
-    action: int,
-    reward: float,
-    next_obs: jax.Array,
-    gamma: float,
-) -> Tuple[Any, float]:
-    """
-    Compute gradients for Q-learning update.
-    
-    Args:
-        agent: Current agent
-        obs: Current observation
-        action: Action taken
-        reward: Reward received
-        next_obs: Next observation
-        gamma: Discount factor
-        
-    Returns:
-        Tuple of (gradients, TD error squared as loss)
-    """
-    def loss_fn(agent: DeepQNetwork) -> jax.Array:
-        # Current Q-value for the action taken
-        q_vals = agent.q_values(obs)
-        q_current = q_vals[action]
-        
-        # Target Q-value (using stop_gradient to prevent gradients from flowing through target)
-        next_q_vals = jax.lax.stop_gradient(agent.q_values(next_obs))
-        q_target = reward + gamma * jnp.max(next_q_vals)
-        
-        # TD error
-        td_error = q_target - q_current
-        
-        # Loss is squared TD error
-        return td_error ** 2
-    
-    # Compute gradients using automatic differentiation
-    loss, gradients = eqx.filter_value_and_grad(loss_fn)(agent)
-    
-    return gradients, loss
-
-
 class TrainState(eqx.Module):
     """Training state for deep Q-learning."""
     # Static
@@ -214,8 +171,7 @@ def train_step(train_state: TrainState) -> Tuple[TrainState, dict]:
     )
     
     # Compute gradients
-    gradients, loss = compute_gradients(
-        agent = train_state.agent,
+    gradients, loss = train_state.agent.compute_grads_and_loss(
         obs = obs,
         action = action,
         reward = reward,
