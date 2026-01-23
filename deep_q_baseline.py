@@ -12,7 +12,11 @@ import numpy as np
 import optax
 from tqdm import tqdm
 
-from catch_env import CatchEnvironment, CatchEnvironmentState
+from catch_env import (
+    CatchEnvironment, 
+    CatchEnvironmentState, 
+    MultiCatchEnvironment,
+)
 from utils import configure_jax_config, tree_replace
 
 
@@ -232,7 +236,6 @@ def create_train_state(
     hidden_dims: Optional[List[int]] = None,
     seed: Optional[int] = None,
     log_interval: int = 100,
-    num_envs: int = 1,
 ) -> TrainState:
     """
     Create and initialize training state.
@@ -256,14 +259,14 @@ def create_train_state(
     key = random.PRNGKey(seed)
     
     # Get environment dimensions
-    obs_dim = CatchEnvironment.observation_space_size(env_state)
-    num_actions = CatchEnvironment.action_space_size(env_state)
+    obs_dim = MultiCatchEnvironment.observation_space_size(env_state)
+    num_actions = MultiCatchEnvironment.action_space_size(env_state)
     
     # Initialize agent
     key, agent_key = random.split(key)
     agent = DeepQAgent(
-        num_actions = num_actions * num_envs,
-        obs_dim = obs_dim * num_envs,
+        num_actions = num_actions,
+        obs_dim = obs_dim,
         hidden_dims = hidden_dims,
         key = agent_key,
     )
@@ -276,8 +279,7 @@ def create_train_state(
     optimizer_state = optimizer.init(dummy_grads)
     
     # Reset environment
-    key, reset_key = random.split(key)
-    env_state, _ = CatchEnvironment.reset(env_state, reset_key)
+    env_state, _ = MultiCatchEnvironment.reset(env_state)
     
     return TrainState(
         gamma = gamma,
@@ -299,7 +301,7 @@ def train_step(train_state: TrainState) -> Tuple[TrainState, dict]:
         Tuple of (updated train_state, metrics dict)
     """
     # Get current observation
-    obs = jax.vmap(CatchEnvironment._get_observation, in_axes=0)(train_state.env_state)
+    obs = MultiCatchEnvironment._get_observation(train_state.env_state)
     
     # Select action
     key, action_key = random.split(train_state.rng)
@@ -310,9 +312,9 @@ def train_step(train_state: TrainState) -> Tuple[TrainState, dict]:
     )
     
     # Take step
-    new_env_state, next_obs, reward, info = CatchEnvironment.step(
-        train_state.env_state,
-        action,
+    new_env_state, next_obs, reward, info = MultiCatchEnvironment.step(
+        train_state.env_state, 
+        action
     )
     
     # Compute gradients
@@ -452,14 +454,13 @@ def main():
         partial(CatchEnvironmentState,
             rows = 10,
             cols = 5,
-            hot_prob = 1.0,
-            reset_prob = 1.0,
+            hot_prob = min(2.0 / args.num_envs, 1.0),
+            reset_prob = 0.2,
             paddle_noise = 0.2,
-            reward_indicator_duration_min = 1,
-            reward_indicator_duration_max = 3,
+            reward_delivery_prob = 0.2,
         ),
         in_axes = 0,
-    )(seed = env_seeds)
+    )(seed=env_seeds)
     
     # Create training state
     train_state = create_train_state(
@@ -470,7 +471,6 @@ def main():
         hidden_dims = args.hidden_dims,
         seed = train_state_seed,
         log_interval = args.log_interval,
-        num_envs = args.num_envs,
     )
     
     # Start MLFlow run and log hyperparameters

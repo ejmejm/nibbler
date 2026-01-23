@@ -15,8 +15,7 @@ class CatchEnvironmentState(eqx.Module):
     cols: int = eqx.field(static=True)
     hot_prob: float
     reset_prob: float
-    reward_indicator_duration_min: int
-    reward_indicator_duration_max: int
+    reward_delivery_prob: float
     paddle_noise: float
     
     # Dynamic parameters (state)
@@ -30,7 +29,6 @@ class CatchEnvironmentState(eqx.Module):
     miss_bit: jax.Array  # Whether the ball was just missed
     plus_bit: jax.Array  # Whether a positive reward is forthcoming
     minus_bit: jax.Array  # Whether a negative reward is forthcoming
-    reward_countdown: jax.Array  # Countdown for reward after plus/minus bit activation
     
     def __init__(
         self,
@@ -38,8 +36,7 @@ class CatchEnvironmentState(eqx.Module):
         cols: int = 5,
         hot_prob: float = 0.3,
         reset_prob: float = 0.2,
-        reward_indicator_duration_min: int = 1,
-        reward_indicator_duration_max: int = 3,
+        reward_delivery_prob: float = 0.2,
         paddle_noise: float = 0.0,
         seed: Optional[int] = None,
     ):
@@ -51,8 +48,7 @@ class CatchEnvironmentState(eqx.Module):
         self.cols = cols
         self.hot_prob = hot_prob
         self.reset_prob = reset_prob
-        self.reward_indicator_duration_min = reward_indicator_duration_min
-        self.reward_indicator_duration_max = reward_indicator_duration_max
+        self.reward_delivery_prob = reward_delivery_prob
         self.paddle_noise = paddle_noise
         
         # Set up RNG
@@ -74,7 +70,6 @@ class CatchEnvironmentState(eqx.Module):
         self.miss_bit = jnp.array(False)
         self.plus_bit = jnp.array(False)
         self.minus_bit = jnp.array(False)
-        self.reward_countdown = jnp.array(0)
 
 
 class CatchEnvironment(eqx.Module):
@@ -123,16 +118,7 @@ class CatchEnvironment(eqx.Module):
     
     @staticmethod
     def step(state: CatchEnvironmentState, action: int) -> Tuple[CatchEnvironmentState, jax.Array, jax.Array, Dict]:
-        """
-        Take a step in the environment based on the provided action.
-        
-        Args:
-            state: The current environment state
-            action: 0 (left), 1 (stay), or 2 (right)
-            
-        Returns:
-            Tuple of (new_state, observation, reward, info)
-        """
+        """Take a step in the environment based on the provided action."""
         # Apply paddle noise: with probability paddle_noise, replace action with random action
         key, subkey_noise = random.split(state.rng)
         subkey_noise, subkey_action = random.split(subkey_noise)
@@ -161,12 +147,11 @@ class CatchEnvironment(eqx.Module):
         miss_bit = state.miss_bit
         plus_bit = state.plus_bit
         minus_bit = state.minus_bit
-        reward_countdown = state.reward_countdown
         
         # === HANDLE BIT FLOW: catch/miss -> plus/minus -> reset ===
         # Flow logic:
         # 1. If catch/miss is active, deactivate it and activate plus/minus (if hot) or reset (if not hot)
-        # 2. If plus/minus is active and countdown reaches 0, deactivate it and activate reset
+        # 2. If plus/minus is active, check probability each step to deactivate it and activate reset
         # 3. Reset can only be active when catch/miss and plus/minus are both inactive
         
         # Check if catch/miss was active (from previous step)
@@ -178,20 +163,11 @@ class CatchEnvironment(eqx.Module):
         miss_bit = jnp.array(False)
         
         # When catch/miss was active, transition to next state
-        # If hot is True, activate plus/minus (and set countdown)
+        # If hot is True, activate plus/minus
         # If hot is False, activate reset immediately
         should_activate_plus = catch_was_active & is_hot
         should_activate_minus = miss_was_active & is_hot
         should_activate_reset_from_catch_miss = (catch_was_active | miss_was_active) & ~is_hot
-        
-        # Generate random duration for plus/minus if needed
-        key, subkey4 = random.split(key)
-        duration = random.randint(
-            subkey4, 
-            (), 
-            state.reward_indicator_duration_min,
-            state.reward_indicator_duration_max + 1
-        )
         
         # Activate plus/minus if catch/miss happened and hot is True
         plus_bit = jnp.where(
@@ -204,28 +180,27 @@ class CatchEnvironment(eqx.Module):
             True,
             minus_bit,
         )
-        reward_countdown = jnp.where(
-            should_activate_plus | should_activate_minus,
-            duration + 1, # +1 because it will be decremented this step
-            reward_countdown,
-        )
         
-        # === HANDLE REWARD COUNTDOWN AND REWARD DELIVERY ===
-        plus_minus_just_finished = reward_countdown == 1
-        reward_countdown = jnp.where(
-            reward_countdown > 0,
-            reward_countdown - 1,
-            reward_countdown,
-        )
+        # === HANDLE REWARD DELIVERY WITH PROBABILITY ===
+        # Each step that plus/minus is already active (from previous step), check probability
+        # Don't check on the step it's first activated - it should be visible for at least one step
+        plus_was_already_active = state.plus_bit
+        minus_was_already_active = state.minus_bit
+        plus_minus_was_already_active = plus_was_already_active | minus_was_already_active
         
-        # If reward countdown reached 0, issue reward
+        key, subkey4 = random.split(key)
+        should_deliver_reward = random.uniform(subkey4) < state.reward_delivery_prob
+        plus_minus_just_finished = plus_minus_was_already_active & should_deliver_reward
+        
+        # If probability check passes, issue reward
+        # Use the previous step's state to determine which reward (plus or minus)
         reward = jnp.where(
-            plus_minus_just_finished & plus_bit,
+            plus_minus_just_finished & plus_was_already_active,
             1.0,
             reward,
         )
         reward = jnp.where(
-            plus_minus_just_finished & minus_bit,
+            plus_minus_just_finished & minus_was_already_active,
             -1.0,
             reward,
         )
@@ -287,14 +262,12 @@ class CatchEnvironment(eqx.Module):
         new_state = eqx.tree_at(
             lambda t: (
                 t.rng, t.ball_row, t.ball_col, t.paddle_col, t.in_reset, 
-                t.is_hot, t.catch_bit, t.miss_bit, t.plus_bit, t.minus_bit,
-                t.reward_countdown
+                t.is_hot, t.catch_bit, t.miss_bit, t.plus_bit, t.minus_bit
             ),
             state,
             (
                 key, ball_row, ball_col, paddle_col, in_reset, 
-                is_hot, catch_bit, miss_bit, plus_bit, minus_bit,
-                reward_countdown
+                is_hot, catch_bit, miss_bit, plus_bit, minus_bit
             )
         )
         
@@ -312,18 +285,14 @@ class CatchEnvironment(eqx.Module):
             "miss_bit": miss_bit,
             "plus_bit": plus_bit,
             "minus_bit": minus_bit,
-            "reward_countdown": reward_countdown,
         }
         
         return new_state, jax.lax.stop_gradient(observation), jax.lax.stop_gradient(reward), info
     
     @staticmethod
-    def reset(state: CatchEnvironmentState, key: Optional[random.PRNGKey] = None) -> Tuple[CatchEnvironmentState, jax.Array]:
+    def reset(state: CatchEnvironmentState) -> Tuple[CatchEnvironmentState, jax.Array]:
         """Reset the environment to an initial state."""
-        if key is None:
-            key, subkey = random.split(state.rng)
-        else:
-            key, subkey = random.split(key)
+        key, subkey = random.split(state.rng)
         
         # Create a fresh state with the same static parameters
         new_state = CatchEnvironmentState(
@@ -331,10 +300,9 @@ class CatchEnvironment(eqx.Module):
             cols=state.cols,
             hot_prob=state.hot_prob,
             reset_prob=state.reset_prob,
-            reward_indicator_duration_min=state.reward_indicator_duration_min,
-            reward_indicator_duration_max=state.reward_indicator_duration_max,
+            reward_delivery_prob=state.reward_delivery_prob,
             paddle_noise=state.paddle_noise,
-            seed=random.randint(subkey, (), 0, 1000000000).item()
+            seed=random.randint(subkey, (), 0, 1000000000),
         )
         
         # Get observation
@@ -353,6 +321,75 @@ class CatchEnvironment(eqx.Module):
         return 3  # left, stay, right
 
 
+class MultiCatchEnvironment(eqx.Module):
+    """
+    Multi-environment wrapper for CatchEnvironment.
+    Manages n independent environments that all take the same action.
+    The observation is the flattened concatenation of all individual observations.
+    """
+    
+    @staticmethod
+    def _get_observation(state: CatchEnvironmentState) -> jax.Array:
+        """Get observation from all environments and concatenate them."""
+        # Get observations from all environments
+        # state is a batched CatchEnvironmentState, so we need to vmap
+        get_obs_fn = jax.vmap(CatchEnvironment._get_observation, in_axes=0)
+        obs = get_obs_fn(state)
+        
+        # Flatten and concatenate all observations
+        return obs.flatten()
+    
+    @staticmethod
+    def step(
+        state: CatchEnvironmentState, 
+        action: int
+    ) -> Tuple[CatchEnvironmentState, jax.Array, jax.Array, Dict]:
+        """Take a step in all environments with the same action."""
+        # Apply the same action to all environments
+        step_fn = jax.vmap(CatchEnvironment.step, in_axes=(0, None))
+        new_env_states, next_obs, rewards, infos = step_fn(state, action)
+        
+        # Flatten and concatenate observations
+        observation = next_obs.flatten()
+        
+        # Sum rewards across all environments
+        reward = jnp.sum(rewards)
+        
+        # Combine info dictionaries (all values are batched)
+        info = {}
+        if infos:
+            # infos is a dict of arrays, we can use it directly
+            info = infos
+        
+        return new_env_states, jax.lax.stop_gradient(observation), jax.lax.stop_gradient(reward), info
+    
+    @staticmethod
+    def reset(state: CatchEnvironmentState) -> Tuple[CatchEnvironmentState, jax.Array]:
+        """Reset all environments to initial states."""
+        # Reset each environment (each will use its own rng from state)
+        reset_fn = jax.vmap(CatchEnvironment.reset, in_axes=0)
+        new_env_states, obs = reset_fn(state)
+        
+        # Flatten and concatenate observations
+        observation = obs.flatten()
+        
+        return new_env_states, observation
+    
+    @staticmethod
+    def observation_space_size(state: CatchEnvironmentState) -> int:
+        """Return the size of the observation space."""
+        single_obs_size = CatchEnvironment.observation_space_size(state)
+        # Get number of environments from the first array field
+        ball_row_shape = state.ball_row.shape
+        num_envs = ball_row_shape[0] if len(ball_row_shape) > 0 else 1
+        return single_obs_size * num_envs
+    
+    @staticmethod
+    def action_space_size(state: CatchEnvironmentState) -> int:
+        """Return the size of the action space."""
+        return CatchEnvironment.action_space_size(state)
+
+
 # Sanity check
 def main():
     """Run a simple sanity check on the environment."""
@@ -363,7 +400,7 @@ def main():
     from io import BytesIO
 
     # Create environment state
-    state = CatchEnvironmentState(seed=42, hot_prob=0.5, reset_prob=0.3)
+    state = CatchEnvironmentState(seed=42, hot_prob=0.9, reset_prob=0.3, reward_delivery_prob=0.2)
 
     # Reset the environment
     state, obs = CatchEnvironment.reset(state)
@@ -431,7 +468,6 @@ def main():
             print(f"  Miss: {info['miss_bit'].item()}")
             print(f"  Plus: {info['plus_bit'].item()}")
             print(f"  Minus: {info['minus_bit'].item()}")
-            print(f"  Reward countdown: {info['reward_countdown'].item()}")
             print()
 
     # Create GIF from all frames
