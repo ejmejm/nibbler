@@ -117,6 +117,47 @@ class DeepQNetwork(eqx.Module):
         greedy_action = jnp.argmax(q_vals)
         
         return jnp.where(explore, random_action, greedy_action)
+    
+    def compute_grads_and_loss(
+        self,
+        obs: Float[Array, 'obs_dim'],
+        action: int,
+        reward: float,
+        next_obs: Float[Array, 'obs_dim'],
+        gamma: float,
+    ) -> Tuple[Any, float]:
+        """Compute gradients for Q-learning update.
+        
+        Args:
+            agent: Current agent
+            obs: Current observation
+            action: Action taken
+            reward: Reward received
+            next_obs: Next observation
+            gamma: Discount factor
+            
+        Returns:
+            Tuple of (gradients, TD error squared as loss)
+        """
+        def loss_fn(network: DeepQNetwork) -> jax.Array:
+            # Current Q-value for the action taken
+            q_vals = network.q_values(obs)
+            q_current = q_vals[action]
+            
+            # Target Q-value (using stop_gradient to prevent gradients from flowing through target)
+            next_q_vals = jax.lax.stop_gradient(network.q_values(next_obs))
+            q_target = reward + gamma * jnp.max(next_q_vals)
+            
+            # TD error
+            td_error = q_target - q_current
+            
+            # Loss is squared TD error
+            return td_error ** 2
+        
+        # Compute gradients using automatic differentiation
+        loss, gradients = eqx.filter_value_and_grad(loss_fn)(self)
+        
+        return gradients, loss
 
 
 class QVNetwork(eqx.Module):
@@ -202,3 +243,77 @@ class QVNetwork(eqx.Module):
         q_values = self.q_separate_mlp(shared_repr)
         state_val = self.v_separate_mlp(shared_repr)
         return q_values, state_val
+
+    def select_action(
+        self,
+        observation: Float[Array, 'obs_dim'],
+        epsilon: float,
+        key: random.PRNGKey,
+    ) -> int:
+        """
+        Select an action using epsilon-greedy policy.
+        
+        Args:
+            observation: Current observation
+            epsilon: Exploration probability
+            key: Random key
+            
+        Returns:
+            Selected action index
+        """
+        q_vals = self.action_values(observation)
+        num_actions = q_vals.shape[0]
+        
+        # Epsilon-greedy: random with prob epsilon, greedy otherwise
+        key1, key2 = random.split(key)
+        explore = random.uniform(key1) < epsilon
+        
+        # Random action
+        random_action = random.randint(key2, (), 0, num_actions)
+        
+        # Greedy action
+        greedy_action = jnp.argmax(q_vals)
+        
+        return jnp.where(explore, random_action, greedy_action)
+    
+    def compute_grads_and_loss(
+        self,
+        obs: Float[Array, 'obs_dim'],
+        action: int,
+        reward: float,
+        next_obs: Float[Array, 'obs_dim'],
+        gamma: float,
+    ) -> Tuple[Any, float]:
+        """Compute gradients for Q-learning update.
+        
+        Args:
+            agent: Current agent
+            obs: Current observation
+            action: Action taken
+            reward: Reward received
+            next_obs: Next observation
+            gamma: Discount factor
+            
+        Returns:
+            Tuple of (gradients, TD error squared as loss)
+        """
+        def loss_fn(network: QVNetwork) -> jax.Array:
+            action_vals, state_val = network.action_and_state_values(obs)
+            
+            # State value TD loss
+            state_val_target = jnp.max(action_vals)
+            state_val_loss = (jax.lax.stop_gradient(state_val_target) - state_val) ** 2
+            
+            # Action value TD loss
+            next_state_val = network.state_value(next_obs)
+            action_val_target = reward + gamma * next_state_val
+            action_val_loss = (jax.lax.stop_gradient(action_val_target) - action_vals[action]) ** 2
+            
+            total_loss = state_val_loss + action_val_loss
+            
+            return total_loss
+        
+        # Compute gradients using automatic differentiation
+        loss, gradients = eqx.filter_value_and_grad(loss_fn)(self)
+        
+        return gradients, loss
