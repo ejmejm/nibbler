@@ -1,3 +1,4 @@
 *.gif
 *.db
 **/__pycache__/
+.vscode/

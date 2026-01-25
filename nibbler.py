@@ -21,8 +21,7 @@ from networks import QVNetwork
 from utils import configure_jax_config, tree_replace
 
 
-UNROLL_STEPS = 4
-
+UNROLL_STEPS = 1
 
 
 class Nibbler(eqx.Module):
@@ -80,7 +79,7 @@ class Nibbler(eqx.Module):
             partial(
                 QVNetwork,
                 n_actions = n_actions,
-                input_dim = obs_dim,
+                input_dim = inputs_per_gvf,
                 shared_hidden_dims = [hidden_dim_per_gvf],
                 separate_hidden_dims = [],
                 activation = jax.nn.relu,
@@ -89,17 +88,32 @@ class Nibbler(eqx.Module):
             in_axes=0,
         )(key=gvf_qv_keys)
         
-        self.gvf_cumulant_feature_idxs = jnp.full(n_gvfs, -1, dtype=jnp.int32)
-        self.gvf_input_feature_idxs = jnp.full((n_gvfs, inputs_per_gvf), -1, dtype=jnp.int32)
+        self.gvf_cumulant_feature_idxs = jax.random.choice(
+            self.rng, obs_dim, (n_gvfs,), replace=False)
+        self.gvf_input_feature_idxs = jax.vmap(
+            lambda key: jax.random.choice(key, obs_dim, (inputs_per_gvf,), replace=False)
+        )(jax.random.split(self.rng, n_gvfs))
+        
+    def get_gvf_inputs(self, observation: Float[Array, 'obs_dim']) -> Float[Array, 'n_gvfs inputs_per_gvf']:
+        return observation.at[self.gvf_input_feature_idxs].get(mode='promise_in_bounds')
+    
+    def get_gvf_cumulants(self, observation: Float[Array, 'obs_dim']) -> Float[Array, 'n_gvfs']:
+        return observation.at[self.gvf_cumulant_feature_idxs].get(mode='promise_in_bounds')
     
     def compute_gvf_features(self, observation: Float[Array, 'obs_dim']) -> Float[Array, 'n_gvfs hidden_dim_per_gvf']:
-        return jnp.zeros((self.n_gvfs, self.hidden_dim_per_gvf))
+        gvf_inputs = self.get_gvf_inputs(observation)
+        batch_compute_features_fn = jax.vmap(
+            lambda model, inputs: model.compute_shared_representation(inputs),
+            in_axes = 0,
+        )
+        gvf_features = batch_compute_features_fn(self.gvf_qv_networks, gvf_inputs)
+        return gvf_features
     
-    def compute_gvf_action_values(self, features: Float[Array, 'n_gvfs hidden_dim_per_gvf']) -> Float[Array, 'n_gvfs n_actions']:
-        return jnp.zeros((self.n_gvfs, self.n_actions))
+    # def compute_gvf_action_values(self, features: Float[Array, 'n_gvfs hidden_dim_per_gvf']) -> Float[Array, 'n_gvfs n_actions']:
+    #     return jnp.zeros((self.n_gvfs, self.n_actions))
     
-    def compute_gvf_state_values(self, features: Float[Array, 'n_gvfs hidden_dim_per_gvf']) -> Float[Array, 'n_gvfs 1']:
-        return jnp.zeros((self.n_gvfs, 1))
+    # def compute_gvf_state_values(self, features: Float[Array, 'n_gvfs hidden_dim_per_gvf']) -> Float[Array, 'n_gvfs 1']:
+    #     return jnp.zeros((self.n_gvfs, 1))
     
     def compute_all_features(self, observation: Float[Array, 'obs_dim']) -> Float[Array, 'total_feature_count']:
         gvf_features = self.compute_gvf_features(observation)  # Shape: (n_gvfs, hidden_dim_per_gvf)
@@ -213,10 +227,10 @@ class TrainState(eqx.Module):
 
 def create_train_state(
     env_state: CatchEnvironmentState,
+    agent: Nibbler,
     optimizer: optax.GradientTransformation,
     gamma: float = 0.99,
     epsilon: float = 0.1,
-    hidden_dims: Optional[List[int]] = None,
     seed: Optional[int] = None,
     log_interval: int = 100,
 ) -> TrainState:
@@ -225,13 +239,12 @@ def create_train_state(
     
     Args:
         env_state: Initial environment state
+        agent: Nibbler agent model
         optimizer: Optax optimizer to use for training
         gamma: Discount factor
         epsilon: Exploration probability (constant)
-        hidden_dims: List of hidden layer dimensions. If None or empty, network is linear.
         seed: Random seed
         log_interval: Interval for logging metrics to MLFlow
-        num_envs: Number of environments
         
     Returns:
         Initialized TrainState
@@ -240,21 +253,6 @@ def create_train_state(
     if seed is None:
         seed = np.random.randint(0, 1000000000)
     key = random.PRNGKey(seed)
-    
-    # Get environment dimensions
-    obs_dim = MultiCatchEnvironment.observation_space_size(env_state)
-    num_actions = MultiCatchEnvironment.action_space_size(env_state)
-    
-    # Initialize agent
-    key, agent_key = random.split(key)
-    agent = Nibbler(
-        n_actions = num_actions,
-        obs_dim = obs_dim,
-        hidden_dim_per_gvf = 256,
-        inputs_per_gvf = 82,
-        n_gvfs = 2,
-        key = agent_key,
-    )
     
     # Initialize optimizer state for output_layer only
     # Compute a dummy gradient to get the structure
@@ -417,7 +415,7 @@ def main():
     parser.add_argument('--seed', type=int, default=None,
                         help='Random seed (default: None)')
     parser.add_argument('--learning_rate', type=float, default=0.001,
-                        help='Learning rate (default: 0.001)')
+                        help='Learning rate scaling factor, which is multiplied by sqrt(2)/sqrt(n_gvfs) (default: 0.001)')
     parser.add_argument('--momentum', type=float, default=0.99,
                         help='Momentum coefficient for SGD (default: 0.99)')
     parser.add_argument('--hidden_dims', type=int, nargs='*', default=[256],
@@ -431,7 +429,15 @@ def main():
     
     ### Nibbler-specific arguments ###
     
+    parser.add_argument('--n_gvfs', type=int, default=10,
+                        help='Number of GVFs (default: 10)')
+    parser.add_argument('--inputs_per_gvf', type=int, default=82,
+                        help='Number of inputs per GVFs (default: 82)')
+    parser.add_argument('--hidden_dim_per_gvf', type=int, default=256,
+                        help='Number of hidden units per GVFs (default: 256)')
+    
     args = parser.parse_args()
+    args.learning_rate *= np.sqrt(2) / np.sqrt(args.n_gvfs)
     configure_jax_config()
     
     key = (
@@ -460,13 +466,28 @@ def main():
         in_axes = 0,
     )(seed=env_seeds)
     
+    # Get environment dimensions
+    obs_dim = MultiCatchEnvironment.observation_space_size(env_state)
+    num_actions = MultiCatchEnvironment.action_space_size(env_state)
+    
+    # Create agent
+    key, agent_key = random.split(key)
+    agent = Nibbler(
+        n_actions = num_actions,
+        obs_dim = obs_dim,
+        hidden_dim_per_gvf = args.hidden_dim_per_gvf,
+        inputs_per_gvf = args.inputs_per_gvf,
+        n_gvfs = args.n_gvfs,
+        key = agent_key,
+    )
+    
     # Create training state
     train_state = create_train_state(
         env_state = env_state,
+        agent = agent,
         optimizer = optimizer,
         gamma = args.gamma,
         epsilon = args.epsilon,
-        hidden_dims = args.hidden_dims,
         seed = train_state_seed,
         log_interval = args.log_interval,
     )
