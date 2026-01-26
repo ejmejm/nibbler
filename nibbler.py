@@ -21,7 +21,7 @@ from networks import QVNetwork
 from utils import configure_jax_config, tree_replace
 
 
-UNROLL_STEPS = 1
+UNROLL_STEPS = 4
 
 
 class Nibbler(eqx.Module):
@@ -30,7 +30,7 @@ class Nibbler(eqx.Module):
     hidden_dim_per_gvf: int = eqx.field(static=True)
     
     output_layer: QVNetwork
-    gvf_qv_networks: QVNetwork # vampped for n_gvfs
+    gvf_networks: QVNetwork # vampped for n_gvfs
     gvf_input_feature_idxs: Int[Array, 'n_gvfs inputs_per_gvf']
     gvf_cumulant_feature_idxs: Int[Array, 'n_gvfs']
     rng: random.PRNGKey
@@ -56,7 +56,7 @@ class Nibbler(eqx.Module):
             n_gvfs: Number of GVFs
             key: Random key for initialization
         """
-        self.rng, output_key, gvf_qv_key = random.split(key, 3)
+        self.rng, output_key, gvf_key = random.split(key, 3)
         
         self.n_gvfs = n_gvfs
         self.hidden_dim_per_gvf = hidden_dim_per_gvf
@@ -74,8 +74,8 @@ class Nibbler(eqx.Module):
         )
         
         # GVF QV networks: shared input layer (obs_dim -> hidden_dim_per_gvf) + linear Q/V
-        gvf_qv_keys = random.split(gvf_qv_key, n_gvfs)
-        self.gvf_qv_networks = jax.vmap(
+        gvf_keys = random.split(gvf_key, n_gvfs)
+        self.gvf_networks = jax.vmap(
             partial(
                 QVNetwork,
                 n_actions = n_actions,
@@ -86,7 +86,7 @@ class Nibbler(eqx.Module):
                 use_bias = False,
             ),
             in_axes=0,
-        )(key=gvf_qv_keys)
+        )(key=gvf_keys)
         
         self.gvf_cumulant_feature_idxs = jax.random.choice(
             self.rng, obs_dim, (n_gvfs,), replace=False)
@@ -106,14 +106,8 @@ class Nibbler(eqx.Module):
             lambda model, inputs: model.compute_shared_representation(inputs),
             in_axes = 0,
         )
-        gvf_features = batch_compute_features_fn(self.gvf_qv_networks, gvf_inputs)
+        gvf_features = batch_compute_features_fn(self.gvf_networks, gvf_inputs)
         return gvf_features
-    
-    # def compute_gvf_action_values(self, features: Float[Array, 'n_gvfs hidden_dim_per_gvf']) -> Float[Array, 'n_gvfs n_actions']:
-    #     return jnp.zeros((self.n_gvfs, self.n_actions))
-    
-    # def compute_gvf_state_values(self, features: Float[Array, 'n_gvfs hidden_dim_per_gvf']) -> Float[Array, 'n_gvfs 1']:
-    #     return jnp.zeros((self.n_gvfs, 1))
     
     def compute_all_features(self, observation: Float[Array, 'obs_dim']) -> Float[Array, 'total_feature_count']:
         gvf_features = self.compute_gvf_features(observation)  # Shape: (n_gvfs, hidden_dim_per_gvf)
@@ -165,6 +159,67 @@ class Nibbler(eqx.Module):
         greedy_action = jnp.argmax(q_vals)
         
         return jnp.where(explore, random_action, greedy_action)
+    
+    def compute_grads_and_loss(
+        self,
+        obs: Float[Array, 'obs_dim'],
+        action: int,
+        reward: float,
+        next_obs: Float[Array, 'obs_dim'],
+        gamma: float,
+    ) -> Tuple[Any, float]:
+        """Compute gradients for Q-learning update.
+        
+        Args:
+            agent: Current agent
+            obs: Current observation
+            action: Action taken
+            reward: Reward received
+            next_obs: Next observation
+            gamma: Discount factor
+            
+        Returns:
+            Tuple of (gradients, TD error squared as loss)
+        """
+        ### First compute gradients for the output layer ###
+        
+        all_features = self.compute_all_features(obs)
+        next_all_features = self.compute_all_features(next_obs)
+        output_layer_grads, output_layer_loss = self.output_layer.compute_grads_and_loss(
+            obs = all_features,
+            action = action,
+            reward = reward,
+            next_obs = next_all_features,
+            gamma = gamma,
+        )
+        
+        ### Then compute gradients for the GVF networks ###
+        
+        gvf_inputs = self.get_gvf_inputs(obs)
+        next_gvf_inputs = self.get_gvf_inputs(next_obs)
+        gvf_cumulants = self.get_gvf_cumulants(obs)
+        
+        batch_gvf_grad_fn = jax.vmap(
+            lambda model, *args: model.compute_grads_and_loss(*args),
+            in_axes = (0, 0, None, 0, 0, None),
+        )
+        gvf_grads, gvf_losses = batch_gvf_grad_fn(
+            self.gvf_networks, gvf_inputs, action,
+            gvf_cumulants, next_gvf_inputs, gamma,
+        )
+        
+        ### Combine losses and gradients ###
+        
+        total_loss = output_layer_loss + jnp.sum(gvf_losses)
+        gradients = eqx.filter(self, lambda x: jnp.issubdtype(x.dtype, jnp.floating))
+        gradients = jax.tree.map(lambda x: jnp.zeros_like(x), gradients)
+        gradients = tree_replace(
+            gradients,
+            output_layer = output_layer_grads,
+            gvf_networks = gvf_grads,
+        )
+        
+        return gradients, total_loss
 
 
 def create_optimizer(
@@ -255,11 +310,8 @@ def create_train_state(
     key = random.PRNGKey(seed)
     
     # Initialize optimizer state for output_layer only
-    # Compute a dummy gradient to get the structure
-    def dummy_loss(output_layer):
-        return 0.0
-    _, dummy_grads = eqx.filter_value_and_grad(dummy_loss)(agent.output_layer)
-    optimizer_state = optimizer.init(dummy_grads)
+    trainable_params = eqx.filter(agent, lambda x: jnp.issubdtype(x.dtype, jnp.floating))
+    optimizer_state = optimizer.init(trainable_params)
     
     # Reset environment
     env_state, _ = MultiCatchEnvironment.reset(env_state)
@@ -300,33 +352,21 @@ def train_step(train_state: TrainState) -> Tuple[TrainState, dict]:
         action
     )
     
-    # TODO: For now just updating the output layer
-    # Compute features from observations
-    obs_features = train_state.agent.compute_all_features(obs)
-    next_obs_features = train_state.agent.compute_all_features(next_obs)
-    
     # Compute gradients
-    gradients, loss = train_state.agent.output_layer.compute_grads_and_loss(
-        obs = obs_features,
+    gradients, loss = train_state.agent.compute_grads_and_loss(
+        obs = obs,
         action = action,
         reward = reward,
-        next_obs = next_obs_features,
+        next_obs = next_obs,
         gamma = train_state.gamma,
     )
     
     # Apply gradients to output_layer only
-    updated_output_layer, new_optimizer_state = apply_gradients(
-        agent = train_state.agent.output_layer,
+    updated_agent, new_optimizer_state = apply_gradients(
+        agent = train_state.agent,
         gradients = gradients,
         optimizer_state = train_state.optimizer_state,
         optimizer = train_state.optimizer,
-    )
-    
-    # Update the agent's output_layer
-    updated_agent = eqx.tree_at(
-        lambda x: x.output_layer,
-        train_state.agent,
-        updated_output_layer,
     )
     
     # Update train state
