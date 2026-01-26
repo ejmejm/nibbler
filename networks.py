@@ -299,15 +299,14 @@ class QVNetwork(eqx.Module):
         """
         def loss_fn(network: QVNetwork) -> jax.Array:
             action_vals, state_val = network.action_and_state_values(obs)
+            next_state_val = network.state_value(next_obs)
+            target_value = jax.lax.stop_gradient(reward + gamma * next_state_val)
             
             # State value TD loss
-            state_val_target = jnp.max(action_vals, keepdims=True)
-            state_val_loss = (jax.lax.stop_gradient(state_val_target) - state_val) ** 2
+            state_val_loss = (target_value - state_val) ** 2
             
             # Action value TD loss
-            next_state_val = network.state_value(next_obs)
-            action_val_target = reward + gamma * next_state_val
-            action_val_loss = (jax.lax.stop_gradient(action_val_target) - action_vals[action]) ** 2
+            action_val_loss = (target_value - action_vals[action]) ** 2
             
             total_loss = jnp.sum(state_val_loss + action_val_loss)
             
