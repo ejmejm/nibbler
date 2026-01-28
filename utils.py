@@ -1,7 +1,8 @@
-from typing import Optional
+from typing import Any, Optional
 
 import equinox as eqx
 import jax
+import jax.numpy as jnp
 
 
 def tree_replace(tree: eqx.Module, **kwargs) -> eqx.Module:
@@ -24,3 +25,7 @@ def configure_jax_config(
         print(f"JAX is using device: {jax.devices(device)[0]}")
     else:
         print(f"JAX is using the device: {jax.devices()[0]}")
+
+
+def is_float_array(x: Any) -> bool:
+    return isinstance(x, jnp.ndarray) and jnp.issubdtype(x.dtype, jnp.floating)

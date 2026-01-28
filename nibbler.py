@@ -7,7 +7,7 @@ import equinox.nn as nn
 import jax
 import jax.numpy as jnp
 from jax import random
-from jaxtyping import Array, Bool, Float, Int
+from jaxtyping import Array, Bool, Float, Int, PyTree
 import mlflow
 import numpy as np
 import optax
@@ -18,7 +18,7 @@ from catch_env import (
     MultiCatchEnvironment,
 )
 from networks import MLP, QVNetwork
-from utils import configure_jax_config, tree_replace
+from utils import configure_jax_config, is_float_array, tree_replace
 
 
 UNROLL_STEPS = 4
@@ -27,7 +27,12 @@ UNROLL_STEPS = 4
 class Nibbler(eqx.Module):
     total_feature_count: int = eqx.field(static=True)
     n_gvfs: int = eqx.field(static=True)
+    inputs_per_gvf: int = eqx.field(static=True)
     hidden_dim_per_gvf: int = eqx.field(static=True)
+    obs_dim: int = eqx.field(static=True)
+    n_actions: int = eqx.field(static=True)
+    input_replace_threshold: float = eqx.field(static=True)
+    cumulant_replace_threshold: float = eqx.field(static=True)
     
     output_layer: QVNetwork
     gvf_networks: QVNetwork # vampped for n_gvfs
@@ -41,8 +46,10 @@ class Nibbler(eqx.Module):
         n_actions: int,
         obs_dim: int,
         hidden_dim_per_gvf: int,
-        inputs_per_gvf: int,
-        n_gvfs: int,
+        inputs_per_gvf: int, # g
+        n_gvfs: int, # h
+        input_replace_threshold: float = 0.0, # tau_K
+        cumulant_replace_threshold: float = 0.0, # tau_I
         *,
         key: random.PRNGKey,
     ):
@@ -55,13 +62,20 @@ class Nibbler(eqx.Module):
             hidden_dim_per_gvf: Number of hidden units per GVF
             inputs_per_gvf: Number of inputs per GVF
             n_gvfs: Number of GVFs
+            input_replace_threshold: Utility difference threshold for replacing GVF inputs
+            cumulant_replace_threshold: Utility difference threshold for replacing GVF cumulants
             key: Random key for initialization
         """
         self.rng, output_key, reward_predictor_key, gvf_key = random.split(key, 4)
         
+        self.obs_dim = obs_dim
+        self.n_actions = n_actions
+        self.inputs_per_gvf = inputs_per_gvf
         self.n_gvfs = n_gvfs
         self.hidden_dim_per_gvf = hidden_dim_per_gvf
-        self.total_feature_count = obs_dim + hidden_dim_per_gvf * n_gvfs
+        self.total_feature_count = obs_dim + hidden_dim_per_gvf * n_gvfs # m
+        self.input_replace_threshold = input_replace_threshold
+        self.cumulant_replace_threshold = cumulant_replace_threshold
         
         # Output layer: QVNetwork with linear action value and value functions
         self.output_layer = QVNetwork(
@@ -83,26 +97,30 @@ class Nibbler(eqx.Module):
         )
         
         # GVF QV networks: shared input layer (obs_dim -> hidden_dim_per_gvf) + linear Q/V
-        gvf_keys = random.split(gvf_key, n_gvfs)
-        self.gvf_networks = jax.vmap(
-            partial(
-                QVNetwork,
-                n_actions = n_actions,
-                input_dim = inputs_per_gvf,
-                shared_hidden_dims = [hidden_dim_per_gvf],
-                separate_hidden_dims = [],
-                activation = jax.nn.relu,
-                use_bias = False,
-            ),
-            in_axes=0,
-        )(key=gvf_keys)
+        self.gvf_networks = self._make_gvf_networks(gvf_key)
         
         self.gvf_cumulant_feature_idxs = jax.random.choice(
             self.rng, obs_dim, (n_gvfs,), replace=False)
         self.gvf_input_feature_idxs = jax.vmap(
             lambda key: jax.random.choice(key, obs_dim, (inputs_per_gvf,), replace=False)
         )(jax.random.split(self.rng, n_gvfs))
-        
+    
+    def _make_gvf_networks(self, key: random.PRNGKey) -> QVNetwork:
+        keys = random.split(key, self.n_gvfs)
+        gvf_networks = jax.vmap(
+            partial(
+                QVNetwork,
+                n_actions = self.n_actions,
+                input_dim = self.inputs_per_gvf,
+                shared_hidden_dims = [self.hidden_dim_per_gvf],
+                separate_hidden_dims = [],
+                activation = jax.nn.relu,
+                use_bias = False,
+            ),
+            in_axes=0,
+        )(key=keys)
+        return gvf_networks
+    
     def get_gvf_inputs(self, observation: Float[Array, 'obs_dim']) -> Float[Array, 'n_gvfs inputs_per_gvf']:
         return observation.at[self.gvf_input_feature_idxs].get(mode='promise_in_bounds')
     
@@ -209,7 +227,7 @@ class Nibbler(eqx.Module):
             reward_loss = jnp.sum((reward - reward_prediction) ** 2)
             return reward_loss
         
-        reward_loss, reward_grads = jax.value_and_grad(reward_loss_fn)(self.reward_predictor)
+        reward_loss, reward_grads = eqx.filter_value_and_grad(reward_loss_fn)(self.reward_predictor)
         
         ### Then compute gradients for the GVF networks ###
         
@@ -229,7 +247,7 @@ class Nibbler(eqx.Module):
         ### Combine losses and gradients ###
         
         total_loss = output_layer_loss + jnp.sum(gvf_losses)
-        gradients = eqx.filter(self, lambda x: jnp.issubdtype(x.dtype, jnp.floating))
+        gradients = eqx.filter(self, is_float_array)
         # Zero out in case there are any parameters we missed in the filter that should be frozen
         gradients = jax.tree.map(lambda x: jnp.zeros_like(x), gradients)
         gradients = tree_replace(
@@ -247,6 +265,38 @@ class Nibbler(eqx.Module):
         }
         
         return gradients, losses
+    
+    def with_update(
+        self,
+        obs: Float[Array, 'obs_dim'],
+        action: int,
+        reward: float,
+        next_obs: Float[Array, 'obs_dim'],
+        gamma: float,
+        optimizer: optax.GradientTransformation,
+        optimizer_state: optax.OptState,
+    ) -> Tuple['Nibbler', optax.OptState]:
+        # Compute GVF input and cumulant changes
+        
+        # Reset GVF weights according to the changes
+        
+        # Reset momentum states according to the changes
+        
+        # Compute gradients
+        gradients, losses = self.compute_grads_and_loss(
+            obs = obs,
+            action = action,
+            reward = reward,
+            next_obs = next_obs,
+            gamma = gamma,
+        )
+        
+        # Apply gradients to the model weights
+        updates, new_optimizer_state = optimizer.update(gradients, optimizer_state)
+        updated_agent = eqx.apply_updates(self, updates)
+        
+        return updated_agent, new_optimizer_state, losses
+        
 
 
 def incremental_top_k(
@@ -305,36 +355,6 @@ def create_optimizer(
     )
 
 
-def apply_gradients(
-    agent: Nibbler,
-    gradients: Any,
-    optimizer_state: optax.OptState,
-    optimizer: optax.GradientTransformation,
-) -> Tuple[Nibbler, optax.OptState]:
-    """
-    Apply gradients to the agent using the optimizer.
-    
-    Args:
-        agent: Current agent
-        gradients: Gradients to apply (PyTree matching agent structure)
-        optimizer_state: Current optimizer state
-        optimizer: Optax optimizer
-        
-    Returns:
-        Tuple of (updated agent, updated optimizer state)
-    """
-    # Compute updates from gradients
-    updates, new_optimizer_state = optimizer.update(
-        gradients,
-        optimizer_state,
-    )
-    
-    # Apply updates to agent
-    updated_agent = eqx.apply_updates(agent, updates)
-    
-    return updated_agent, new_optimizer_state
-
-
 class TrainState(eqx.Module):
     """Training state for deep Q-learning."""
     # Static
@@ -381,7 +401,7 @@ def create_train_state(
     key = random.PRNGKey(seed)
     
     # Initialize optimizer state for output_layer only
-    trainable_params = eqx.filter(agent, lambda x: jnp.issubdtype(x.dtype, jnp.floating))
+    trainable_params = eqx.filter(agent, is_float_array)
     optimizer_state = optimizer.init(trainable_params)
     
     # Reset environment
@@ -423,21 +443,14 @@ def train_step(train_state: TrainState) -> Tuple[TrainState, dict]:
         action
     )
     
-    # Compute gradients
-    gradients, losses = train_state.agent.compute_grads_and_loss(
+    updated_agent, new_optimizer_state, losses = train_state.agent.with_update(
         obs = obs,
         action = action,
         reward = reward,
         next_obs = next_obs,
         gamma = train_state.gamma,
-    )
-    
-    # Apply gradients to output_layer only
-    updated_agent, new_optimizer_state = apply_gradients(
-        agent = train_state.agent,
-        gradients = gradients,
-        optimizer_state = train_state.optimizer_state,
         optimizer = train_state.optimizer,
+        optimizer_state = train_state.optimizer_state,
     )
     
     # Update train state
