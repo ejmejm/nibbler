@@ -187,6 +187,54 @@ class Nibbler(eqx.Module):
         
         return jnp.where(explore, random_action, greedy_action)
     
+    def _get_updated_gvf_cumulant_feature_idxs_and_reset_mask(self) -> Tuple[Int[Array, 'n_gvfs'], PyTree]:
+        """Computes the new cumulant feature idxs and a mask for any features that need to be reset."""
+        feature_utilities = jnp.abs(self.reward_predictor.layers[0].weight.squeeze(axis=0))
+        new_cumulant_feature_idxs, selection_mask, is_changed, changed_gvf_idx = incremental_top_k(
+            selected_indices = self.gvf_cumulant_feature_idxs,
+            feature_utilities = feature_utilities,
+            num_features = self.obs_dim,
+            tau = self.cumulant_replace_threshold,
+        )
+        
+        def make_gvf_weight_reset_mask(zeros: Bool[Array, 'n_gvfs ...']) -> Bool[Array, 'n_gvfs ...']:
+            mask = zeros.at[changed_gvf_idx].set(is_changed)
+            return mask
+        
+        # The paper mentions resetting w^pos_u, but not w^pos_v or w^pos_q,a. It probably is resetting all three though (and output weights), right?
+        # I'm going to assume that this is a bug in the paper and that all of the GVF network's weights and momentum states should be reset.
+        
+        # Start with a mask of zeros for the full model
+        full_zeros_mask: Nibbler = jax.tree.map(lambda x: jnp.zeros_like(x, dtype=jnp.bool_), self)
+        
+        # Then fill out the GVF weight reset mask
+        gvf_weight_reset_mask = jax.tree.map(make_gvf_weight_reset_mask, full_zeros_mask.gvf_networks)
+        
+        # Then fill out the output layer weight reset mask
+        start_idx = self.obs_dim + changed_gvf_idx * self.hidden_dim_per_gvf
+        end_idx = start_idx + self.hidden_dim_per_gvf * is_changed
+        # Use dynamic indexing with a boolean mask since start_idx/end_idx are traced
+        def make_output_weight_reset_mask(zeros: Bool[Array, 'n_actions n_features']) -> Bool[Array, 'n_actions n_features']:
+            n_features = zeros.shape[1]
+            feature_indices = jnp.arange(n_features)
+            feature_mask = (feature_indices >= start_idx) & (feature_indices < end_idx)
+            return jnp.where(feature_mask[None, :], is_changed, zeros)
+        
+        # Map setting the mask over the state value and action value weights
+        output_weight_reset_mask = jax.tree.map(
+            make_output_weight_reset_mask,
+            full_zeros_mask.output_layer,
+        )
+        
+        full_weight_mask = tree_replace(
+            full_zeros_mask,
+            gvf_networks = gvf_weight_reset_mask,
+            output_layer = output_weight_reset_mask,
+        )
+        
+        return new_cumulant_feature_idxs, full_weight_mask
+        
+    
     def compute_grads_and_loss(
         self,
         obs: Float[Array, 'obs_dim'],
@@ -277,13 +325,36 @@ class Nibbler(eqx.Module):
         optimizer_state: optax.OptState,
     ) -> Tuple['Nibbler', optax.OptState]:
         # Compute GVF input and cumulant changes
+        new_cumulant_feature_idxs, weight_reset_masks = self._get_updated_gvf_cumulant_feature_idxs_and_reset_mask()
+        # TODO: Add input feature resetting
         
         # Reset GVF weights according to the changes
+        new_rng, gvf_key = random.split(self.rng)
+        reset_gvf_networks = self._make_gvf_networks(gvf_key)
+        
+        updated_gvf_networks = masked_weight_replace(
+            tree = self.gvf_networks,
+            mask_tree = weight_reset_masks.gvf_networks,
+            replace_tree = reset_gvf_networks,
+        )
+        updated_output_layer = masked_weight_replace(
+            tree = self.output_layer,
+            mask_tree = weight_reset_masks.output_layer,
+        )
+        
+        updated_agent: Nibbler = tree_replace(
+            self,
+            gvf_cumulant_feature_idxs = new_cumulant_feature_idxs,
+            gvf_networks = updated_gvf_networks,
+            output_layer = updated_output_layer,
+            rng = new_rng,
+        )
         
         # Reset momentum states according to the changes
+        # TODO: Add momentum state resetting
         
         # Compute gradients
-        gradients, losses = self.compute_grads_and_loss(
+        gradients, losses = updated_agent.compute_grads_and_loss(
             obs = obs,
             action = action,
             reward = reward,
@@ -293,10 +364,37 @@ class Nibbler(eqx.Module):
         
         # Apply gradients to the model weights
         updates, new_optimizer_state = optimizer.update(gradients, optimizer_state)
-        updated_agent = eqx.apply_updates(self, updates)
+        updated_agent = eqx.apply_updates(updated_agent, updates)
         
         return updated_agent, new_optimizer_state, losses
+
+
+def masked_weight_replace(tree: PyTree, mask_tree: PyTree, replace_tree: PyTree | None = None) -> PyTree:
+    """
+    Replace elements of `tree` with corresponding values from `replace_tree`
+    wherever `mask_tree` is True. If `replace_tree` is None, use zeros_like(tree).
+    
+    Args:
+        tree: PyTree of parameters.
+        mask_tree: PyTree of boolean masks (same structure as tree), True means "replace".
+        replace_tree: PyTree of replacement values or None (default is zeros_like(tree)).
         
+    Returns:
+        PyTree with replaced values where mask_tree is True.
+    """
+    if replace_tree is None:
+        return jax.tree.map(
+            lambda mask, w: jnp.where(mask, jnp.zeros_like(w), w),
+            mask_tree,
+            tree,
+        )
+    else:
+        return jax.tree.map(
+            lambda mask, r, w: jnp.where(mask, r, w),
+            mask_tree,
+            replace_tree,
+            tree,
+        )
 
 
 def incremental_top_k(
@@ -309,7 +407,7 @@ def incremental_top_k(
         f"Feature utilities must have length num_features ({num_features}), "
         f"but has length {feature_utilities.shape[0]}"
     )
-    assert 0 > selected_indices.shape[0] > num_features, (
+    assert 0 < selected_indices.shape[0] < num_features, (
         f"Selected indices must have length (exclusive) between 0 and num_features ({num_features}), "
         f"but has length {selected_indices.shape[0]}"
     )
@@ -472,7 +570,7 @@ def train_step(train_state: TrainState) -> Tuple[TrainState, dict]:
     return new_train_state, metrics
 
 
-def train_deep_q(
+def train_model(
     train_state: TrainState,
     num_steps: int = 100000,
 ) -> TrainState:
@@ -506,6 +604,21 @@ def train_deep_q(
     # Run full batch iterations
     for _ in range(num_scans):
         train_state, metrics = multi_step_train(train_state)
+        
+        
+        
+        cumulant_feature_idxs = train_state.agent.gvf_cumulant_feature_idxs
+        utilities = jnp.abs(train_state.agent.reward_predictor.layers[0].weight.squeeze(axis=0))
+        # Compute ranks: highest utility = rank 1, lowest = rank N
+        utility_sort_indices = jnp.argsort(-utilities)  # descending order
+        # Create a mapping from feature index to rank
+        rank_map = {int(idx): int(rank) + 1 for rank, idx in enumerate(utility_sort_indices.tolist())}
+        feature_idxs_list = cumulant_feature_idxs.tolist()
+        print("GVF cumulant feature indices:", feature_idxs_list)
+        print("Utility ranks of those indices:", [rank_map.get(int(idx), None) for idx in feature_idxs_list])
+        
+        
+        
         
         # Average metrics
         avg_reward = metrics['reward'].mean()
@@ -628,7 +741,7 @@ def main():
     mlflow.log_params(args_dict)
     
     # Train agent
-    train_state = train_deep_q(
+    train_state = train_model(
         train_state = train_state,
         num_steps = args.num_steps,
     )
