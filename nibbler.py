@@ -197,17 +197,20 @@ class Nibbler(eqx.Module):
             tau = self.cumulant_replace_threshold,
         )
         
-        def make_gvf_weight_reset_mask(zeros: Bool[Array, 'n_gvfs ...']) -> Bool[Array, 'n_gvfs ...']:
-            mask = zeros.at[changed_gvf_idx].set(is_changed)
-            return mask
-        
         # The paper mentions resetting w^pos_u, but not w^pos_v or w^pos_q,a. It probably is resetting all three though (and output weights), right?
         # I'm going to assume that this is a bug in the paper and that all of the GVF network's weights and momentum states should be reset.
         
         # Start with a mask of zeros for the full model
-        full_zeros_mask: Nibbler = jax.tree.map(lambda x: jnp.zeros_like(x, dtype=jnp.bool_), self)
+        full_zeros_mask: Nibbler = jax.tree.map(
+            lambda x: jnp.zeros_like(x, dtype=jnp.bool_),
+            eqx.filter(self, is_float_array),
+        )
         
         # Then fill out the GVF weight reset mask
+        def make_gvf_weight_reset_mask(zeros: Bool[Array, 'n_gvfs ...']) -> Bool[Array, 'n_gvfs ...']:
+            mask = zeros.at[changed_gvf_idx].set(is_changed)
+            return mask
+        
         gvf_weight_reset_mask = jax.tree.map(make_gvf_weight_reset_mask, full_zeros_mask.gvf_networks)
         
         # Then fill out the output layer weight reset mask
@@ -351,7 +354,8 @@ class Nibbler(eqx.Module):
         )
         
         # Reset momentum states according to the changes
-        # TODO: Add momentum state resetting
+        new_optimizer_state = reset_sgd_momentum_optim_states(
+            weight_reset_masks, optimizer_state)
         
         # Compute gradients
         gradients, losses = updated_agent.compute_grads_and_loss(
@@ -363,7 +367,7 @@ class Nibbler(eqx.Module):
         )
         
         # Apply gradients to the model weights
-        updates, new_optimizer_state = optimizer.update(gradients, optimizer_state)
+        updates, new_optimizer_state = optimizer.update(gradients, new_optimizer_state)
         updated_agent = eqx.apply_updates(updated_agent, updates)
         
         return updated_agent, new_optimizer_state, losses
@@ -439,6 +443,39 @@ def incremental_top_k(
     )
     
     return selected_indices, selection_mask, changed, pos
+
+
+def reset_sgd_momentum_optim_states(
+    state_reset_masks: PyTree, # Boolean mask with the structure of Nibbler, where 1 is reset
+    optimizer_state: Tuple[optax.TraceState, None, None],
+) -> optax.OptState:
+    """Resets the momentum states of the optimizer based on the weight reset masks."""
+    assert isinstance(optimizer_state, Tuple) and len(optimizer_state) == 3, \
+        f"An SGD with momentum optimizer state is expected to have three components, but got {len(optimizer_state)}."
+    assert isinstance(optimizer_state[0], optax.TraceState), \
+        f"The first component of an SGD with momentum optimizer state is expected to be a TraceState, but got {type(optimizer_state[0])}."
+    assert isinstance(optimizer_state[1], optax.EmptyState) and isinstance(optimizer_state[2], optax.EmptyState), (
+        f"The second and third components of an SGD with momentum optimizer state are expected to be EmptyState, "
+        f"but got {optimizer_state[1]} and {optimizer_state[2]}."
+    )
+    
+    # TODO: Fix error, looks at `[x.shape for x in jax.tree.leaves(optimizer_state[0].trace)]`
+    #       vs. `[x.shape for x in jax.tree.leaves(state_reset_masks)]`
+    #       The reset mask has 3 extra leaves
+    new_trace_state = jax.tree.map(
+        lambda reset_mask, curr_state: jnp.where(
+            reset_mask, jnp.zeros_like(curr_state), curr_state),
+        state_reset_masks,
+        optimizer_state[0].trace,
+    )
+    
+    new_optimizer_state = eqx.tree_at(
+        lambda x: x[0].trace,
+        optimizer_state,
+        new_trace_state,
+    )
+    
+    return new_optimizer_state
 
 
 def create_optimizer(
