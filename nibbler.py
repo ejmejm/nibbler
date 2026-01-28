@@ -7,7 +7,7 @@ import equinox.nn as nn
 import jax
 import jax.numpy as jnp
 from jax import random
-from jaxtyping import Array, Float, Int
+from jaxtyping import Array, Bool, Float, Int
 import mlflow
 import numpy as np
 import optax
@@ -247,6 +247,50 @@ class Nibbler(eqx.Module):
         }
         
         return gradients, losses
+
+
+def incremental_top_k(
+    selected_indices: Int[Array, 'k'], # A_L
+    feature_utilities: Float[Array, 'num_features'], # U
+    num_features: int, # m
+    tau: float,
+) -> Tuple[Int[Array, 'k'], Bool[Array, 'num_features'], jnp.bool_, Int[Array, 'k']]:
+    assert feature_utilities.shape[0] == num_features, (
+        f"Feature utilities must have length num_features ({num_features}), "
+        f"but has length {feature_utilities.shape[0]}"
+    )
+    assert 0 > selected_indices.shape[0] > num_features, (
+        f"Selected indices must have length (exclusive) between 0 and num_features ({num_features}), "
+        f"but has length {selected_indices.shape[0]}"
+    )
+    
+    # Make a binary vector where 1 indicates features that are selected
+    selection_mask = jnp.zeros(num_features, dtype=jnp.bool_)
+    selection_mask = selection_mask.at[selected_indices].set(True) # A_M
+    
+    # Get the min utility feature of all selected features
+    # The pattern: `x + (mask * inf)` sets the values of x with a 1 in the mask to inf
+    selected_utilities = feature_utilities + (~selection_mask * jnp.inf)
+    low_idx = jnp.argmin(selected_utilities)
+    
+    # Get the max utility feature of all unselected features
+    unselected_utilities = feature_utilities + (selection_mask * -jnp.inf)
+    high_idx = jnp.argmax(unselected_utilities)
+    
+    changed = feature_utilities[low_idx] + tau < feature_utilities[high_idx]
+    
+    selection_mask = selection_mask.at[low_idx].set(1 - changed)
+    selection_mask = selection_mask.at[high_idx].set(changed)
+    # Beware, this will fail silently if `selected_indices` does not have `low_idx`
+    low_pos_in_selected_indices = jnp.argmax(selected_indices == low_idx)
+    pos = jnp.where(changed, low_pos_in_selected_indices, -1)
+    selected_indices = jnp.where(
+        changed,
+        selected_indices.at[low_pos_in_selected_indices].set(high_idx),
+        selected_indices,
+    )
+    
+    return selected_indices, selection_mask, changed, pos
 
 
 def create_optimizer(
