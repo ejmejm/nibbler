@@ -17,7 +17,7 @@ from catch_env import (
     CatchEnvironmentState, 
     MultiCatchEnvironment,
 )
-from networks import QVNetwork
+from networks import MLP, QVNetwork
 from utils import configure_jax_config, tree_replace
 
 
@@ -31,6 +31,7 @@ class Nibbler(eqx.Module):
     
     output_layer: QVNetwork
     gvf_networks: QVNetwork # vampped for n_gvfs
+    reward_predictor: MLP
     gvf_input_feature_idxs: Int[Array, 'n_gvfs inputs_per_gvf']
     gvf_cumulant_feature_idxs: Int[Array, 'n_gvfs']
     rng: random.PRNGKey
@@ -56,7 +57,7 @@ class Nibbler(eqx.Module):
             n_gvfs: Number of GVFs
             key: Random key for initialization
         """
-        self.rng, output_key, gvf_key = random.split(key, 3)
+        self.rng, output_key, reward_predictor_key, gvf_key = random.split(key, 4)
         
         self.n_gvfs = n_gvfs
         self.hidden_dim_per_gvf = hidden_dim_per_gvf
@@ -71,6 +72,14 @@ class Nibbler(eqx.Module):
             activation = jax.nn.relu,
             use_bias = False,
             key = output_key,
+        )
+        
+        # Linear predictor of the reward
+        self.reward_predictor = MLP(
+            input_dim = obs_dim,
+            output_dim = 1,
+            use_bias = False,
+            key = reward_predictor_key,
         )
         
         # GVF QV networks: shared input layer (obs_dim -> hidden_dim_per_gvf) + linear Q/V
@@ -193,6 +202,15 @@ class Nibbler(eqx.Module):
             gamma = gamma,
         )
         
+        ### Then compute gradients for the reward predictor ###
+        
+        def reward_loss_fn(reward_predictor: MLP) -> float:
+            reward_prediction = reward_predictor(obs)
+            reward_loss = jnp.sum((reward - reward_prediction) ** 2)
+            return reward_loss
+        
+        reward_loss, reward_grads = jax.value_and_grad(reward_loss_fn)(self.reward_predictor)
+        
         ### Then compute gradients for the GVF networks ###
         
         gvf_inputs = self.get_gvf_inputs(obs)
@@ -212,14 +230,23 @@ class Nibbler(eqx.Module):
         
         total_loss = output_layer_loss + jnp.sum(gvf_losses)
         gradients = eqx.filter(self, lambda x: jnp.issubdtype(x.dtype, jnp.floating))
+        # Zero out in case there are any parameters we missed in the filter that should be frozen
         gradients = jax.tree.map(lambda x: jnp.zeros_like(x), gradients)
         gradients = tree_replace(
             gradients,
             output_layer = output_layer_grads,
+            reward_predictor = reward_grads,
             gvf_networks = gvf_grads,
         )
         
-        return gradients, total_loss
+        losses = {
+            'output': output_layer_loss,
+            'reward': reward_loss,
+            'gvfs': gvf_losses,
+            'total': total_loss,
+        }
+        
+        return gradients, losses
 
 
 def create_optimizer(
@@ -353,7 +380,7 @@ def train_step(train_state: TrainState) -> Tuple[TrainState, dict]:
     )
     
     # Compute gradients
-    gradients, loss = train_state.agent.compute_grads_and_loss(
+    gradients, losses = train_state.agent.compute_grads_and_loss(
         obs = obs,
         action = action,
         reward = reward,
@@ -382,7 +409,7 @@ def train_step(train_state: TrainState) -> Tuple[TrainState, dict]:
     # Compute metrics
     metrics = {
         'reward': reward,
-        'loss': loss,
+        'losses': losses,
     }
     
     return new_train_state, metrics
@@ -425,19 +452,25 @@ def train_deep_q(
         
         # Average metrics
         avg_reward = metrics['reward'].mean()
-        avg_loss = metrics['loss'].mean()
+        avg_output_loss = metrics['losses']['output'].mean()
+        avg_reward_loss = metrics['losses']['reward'].mean()
+        avg_gvfs_loss = metrics['losses']['gvfs'].mean()
+        avg_total_loss = metrics['losses']['total'].mean()
         
         # Update progress bar
         pbar.update(log_interval)
         pbar.set_postfix({
             'avg_reward': f'{avg_reward:.2f}',
-            'avg_loss': f'{avg_loss:.4f}',
+            'avg_loss': f'{avg_output_loss:.4f}',
         })
         
         # Log to MLFlow
         mlflow.log_metrics({
             'avg_reward': avg_reward,
-            'avg_loss': avg_loss,
+            'avg_output_loss': avg_output_loss,
+            'avg_reward_loss': avg_reward_loss,
+            'avg_gvfs_loss': avg_gvfs_loss,
+            'avg_total_loss': avg_total_loss,
         }, step=train_state.step.item())
     
     pbar.close()
