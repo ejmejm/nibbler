@@ -1,9 +1,8 @@
 import argparse
 from functools import partial
-from typing import Optional, Tuple, List, Any
+from typing import Optional, Tuple, Any
 
 import equinox as eqx
-import equinox.nn as nn
 import jax
 import jax.numpy as jnp
 from jax import random
@@ -21,7 +20,7 @@ from networks import MLP, QVNetwork
 from utils import configure_jax_config, is_float_array, tree_replace
 
 
-UNROLL_STEPS = 4
+UNROLL_STEPS = 1 # 4
 
 
 class Nibbler(eqx.Module):
@@ -37,6 +36,7 @@ class Nibbler(eqx.Module):
     output_layer: QVNetwork
     gvf_networks: QVNetwork # vampped for n_gvfs
     reward_predictor: MLP
+    linear_gvf_predictors: MLP # vampped for n_gvfs
     gvf_input_feature_idxs: Int[Array, 'n_gvfs inputs_per_gvf']
     gvf_cumulant_feature_idxs: Int[Array, 'n_gvfs']
     rng: random.PRNGKey
@@ -66,14 +66,14 @@ class Nibbler(eqx.Module):
             cumulant_replace_threshold: Utility difference threshold for replacing GVF cumulants
             key: Random key for initialization
         """
-        self.rng, output_key, reward_predictor_key, gvf_key = random.split(key, 4)
+        self.rng, output_key, reward_predictor_key, gvf_key, linear_gvf_value_key = random.split(key, 5)
         
-        self.obs_dim = obs_dim
+        self.obs_dim = obs_dim # m
         self.n_actions = n_actions
         self.inputs_per_gvf = inputs_per_gvf
         self.n_gvfs = n_gvfs
         self.hidden_dim_per_gvf = hidden_dim_per_gvf
-        self.total_feature_count = obs_dim + hidden_dim_per_gvf * n_gvfs # m
+        self.total_feature_count = obs_dim + hidden_dim_per_gvf * n_gvfs
         self.input_replace_threshold = input_replace_threshold
         self.cumulant_replace_threshold = cumulant_replace_threshold
         
@@ -96,6 +96,18 @@ class Nibbler(eqx.Module):
             key = reward_predictor_key,
         )
         
+        # Linear predictors of the GVF value functions, used to determining utility of base inputs for each GVF
+        linear_gvf_predictor_keys = random.split(linear_gvf_value_key, n_gvfs)
+        self.linear_gvf_predictors = jax.vmap(
+            partial(
+                MLP,
+                input_dim = obs_dim,
+                output_dim = 1,
+                use_bias = False,
+            ),
+            in_axes = 0,
+        )(key=linear_gvf_predictor_keys)
+        
         # GVF QV networks: shared input layer (obs_dim -> hidden_dim_per_gvf) + linear Q/V
         self.gvf_networks = self._make_gvf_networks(gvf_key)
         
@@ -117,7 +129,7 @@ class Nibbler(eqx.Module):
                 activation = jax.nn.relu,
                 use_bias = False,
             ),
-            in_axes=0,
+            in_axes = 0,
         )(key=keys)
         return gvf_networks
     
@@ -273,18 +285,34 @@ class Nibbler(eqx.Module):
         
         ### Then compute gradients for the reward predictor ###
         
-        def reward_loss_fn(reward_predictor: MLP) -> float:
+        @eqx.filter_value_and_grad
+        def reward_loss_and_grad_fn(reward_predictor: MLP) -> float:
             reward_prediction = reward_predictor(obs)
             reward_loss = jnp.sum((reward - reward_prediction) ** 2)
             return reward_loss
         
-        reward_loss, reward_grads = eqx.filter_value_and_grad(reward_loss_fn)(self.reward_predictor)
+        reward_loss, reward_grads = reward_loss_and_grad_fn(self.reward_predictor)
+        
+        ### Then compute the gradients for the linear GVF value predictors ###
+        
+        @partial(jax.vmap, in_axes=0)
+        @eqx.filter_value_and_grad
+        def linear_gvf_predictors_loss_and_grad_fn(linear_gvf_predictor: MLP, cumulant: Float[Array, '']) -> float:
+            curr_gvf_value = linear_gvf_predictor(obs)
+            next_gvf_value = linear_gvf_predictor(next_obs)
+            target_value = jax.lax.stop_gradient(cumulant + gamma * next_gvf_value)
+            loss = jnp.sum((target_value - curr_gvf_value) ** 2)
+            return loss
+        
+        gvf_cumulants = self.get_gvf_cumulants(obs)
+        linear_gvf_predictor_losses, linear_gvf_predictor_grads = linear_gvf_predictors_loss_and_grad_fn(
+            self.linear_gvf_predictors, gvf_cumulants)
+        
         
         ### Then compute gradients for the GVF networks ###
         
         gvf_inputs = self.get_gvf_inputs(obs)
         next_gvf_inputs = self.get_gvf_inputs(next_obs)
-        gvf_cumulants = self.get_gvf_cumulants(obs)
         
         batch_gvf_grad_fn = jax.vmap(
             lambda model, *args: model.compute_grads_and_loss(*args),
@@ -312,6 +340,7 @@ class Nibbler(eqx.Module):
             'output': output_layer_loss,
             'reward': reward_loss,
             'gvfs': gvf_losses,
+            'linear_gvf_predictors': linear_gvf_predictor_losses,
             'total': total_loss,
         }
         
@@ -662,6 +691,7 @@ def train_model(
         avg_output_loss = metrics['losses']['output'].mean()
         avg_reward_loss = metrics['losses']['reward'].mean()
         avg_gvfs_loss = metrics['losses']['gvfs'].mean()
+        avg_linear_gvf_predictor_loss = metrics['losses']['linear_gvf_predictors'].mean()
         avg_total_loss = metrics['losses']['total'].mean()
         
         # Update progress bar
@@ -677,6 +707,7 @@ def train_model(
             'avg_output_loss': avg_output_loss,
             'avg_reward_loss': avg_reward_loss,
             'avg_gvfs_loss': avg_gvfs_loss,
+            'avg_linear_gvf_predictor_loss': avg_linear_gvf_predictor_loss,
             'avg_total_loss': avg_total_loss,
         }, step=train_state.step.item())
     
