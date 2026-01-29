@@ -12,6 +12,7 @@ class MLP(eqx.Module):
     """Multi-layer perceptron with configurable hidden layers and activation function."""
     layers: List[nn.Linear]
     activation: Any = eqx.field(static=True)
+    final_activation: bool = eqx.field(static=True)
     
     def __init__(
         self,
@@ -20,12 +21,14 @@ class MLP(eqx.Module):
         hidden_dims: Optional[List[int]] = None,
         activation: Any = jax.nn.relu,
         use_bias: bool = False,
+        final_activation: bool = False,
         key: random.PRNGKey = None,
     ):
         if hidden_dims is None:
             hidden_dims = []
         
         self.activation = activation
+        self.final_activation = final_activation
         self.layers = []
         
         # Build layer dimensions
@@ -58,6 +61,8 @@ class MLP(eqx.Module):
             x = layer(x)
             x = self.activation(x)
         x = self.layers[-1](x)
+        if self.final_activation:
+            x = self.activation(x)
         return x
 
 
@@ -190,13 +195,15 @@ class QVNetwork(eqx.Module):
             shared_output_dim = shared_hidden_dims[-1]
             # Split keys for the three MLPs
             key, shared_key, q_key, v_key = random.split(key, 4)
-            # Create shared MLP
+            # Create shared MLP: input_dim -> hidden_dims (with activations)
+            # The output is the final hidden layer's activations
             self.shared_mlp = MLP(
                 input_dim = input_dim,
                 output_dim = shared_output_dim,
-                hidden_dims = shared_hidden_dims,
+                hidden_dims = shared_hidden_dims[:-1],  # All but last become hidden layers
                 activation = activation,
                 use_bias = use_bias,
+                final_activation = True,  # Apply activation to the output layer
                 key = shared_key,
             )
         
