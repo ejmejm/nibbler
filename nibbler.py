@@ -20,7 +20,7 @@ from networks import MLP, QVNetwork
 from utils import configure_jax_config, is_float_array, tree_replace
 
 
-UNROLL_STEPS = 1 # 4
+UNROLL_STEPS = 4
 
 
 class Nibbler(eqx.Module):
@@ -778,19 +778,23 @@ def main():
                         help='Hidden layer dimensions (default: None, linear network)')
     parser.add_argument('--log_interval', type=int, default=10_000,
                         help='Logging interval in steps (default: 10000)')
-    parser.add_argument('--num_steps', type=int, default=1_000_000,
-                        help='Total number of training steps (default: 1000000)')
+    parser.add_argument('--num_steps', type=int, default=10_000_000,
+                        help='Total number of training steps (default: 1e6)')
     parser.add_argument('--num_envs', type=int, default=2,
                         help='Total number of environments (default: 2)')
     
     ### Nibbler-specific arguments ###
     
-    parser.add_argument('--n_gvfs', type=int, default=10,
+    parser.add_argument('--n_gvfs', type=int, default=4,
                         help='Number of GVFs (default: 10)')
     parser.add_argument('--inputs_per_gvf', type=int, default=82,
                         help='Number of inputs per GVFs (default: 82)')
     parser.add_argument('--hidden_dim_per_gvf', type=int, default=256,
                         help='Number of hidden units per GVFs (default: 256)')
+    parser.add_argument('--tau_inputs', type=float, default=0.0,
+                        help='Utility difference threshold for replacing GVF inputs (default: 0.0)')
+    parser.add_argument('--tau_cumulants', type=float, default=0.0,
+                        help='Utility difference threshold for replacing GVF cumulants (default: 0.0)')
     
     args = parser.parse_args()
     main_step_size = args.step_size_scaling_factor / np.sqrt(args.n_gvfs)
@@ -815,9 +819,9 @@ def main():
             rows = 10,
             cols = 5,
             hot_prob = min(2.0 / args.num_envs, 1.0),
-            reset_prob = 1.0, # 0.2,
-            paddle_noise = 0.0, # 0.2,
-            reward_delivery_prob = 1.0, # 0.2,
+            reset_prob = 0.2,
+            paddle_noise = 0.2,
+            reward_delivery_prob = 0.2,
         ),
         in_axes = 0,
     )(seed=env_seeds)
@@ -834,6 +838,8 @@ def main():
         hidden_dim_per_gvf = args.hidden_dim_per_gvf,
         inputs_per_gvf = args.inputs_per_gvf,
         n_gvfs = args.n_gvfs,
+        input_replace_threshold = args.tau_inputs,
+        cumulant_replace_threshold = args.tau_cumulants,
         key = agent_key,
     )
     
