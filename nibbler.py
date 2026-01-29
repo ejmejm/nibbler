@@ -23,6 +23,59 @@ from utils import configure_jax_config, is_float_array, tree_replace
 UNROLL_STEPS = 4
 
 
+def parse_args():
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(description='Train deep Q-learning agent')
+    parser.add_argument('--epsilon', type=float, default=0.1,
+                        help='Exploration probability (default: 0.1)')
+    parser.add_argument('--gamma', type=float, default=0.99,
+                        help='Discount factor (default: 0.99)')
+    parser.add_argument('--seed', type=int, default=None,
+                        help='Random seed (default: None)')
+    parser.add_argument('--step_size_scaling_factor', type=float, default=0.00141,
+                        help='Step size scaling factor, which is divided by sqrt(n_gvfs) (default: 0.001 * sqrt(2))')
+    parser.add_argument('--momentum', type=float, default=0.99,
+                        help='Momentum coefficient for SGD (default: 0.99)')
+    parser.add_argument('--hidden_dims', type=int, nargs='*', default=[256],
+                        help='Hidden layer dimensions (default: None, linear network)')
+    parser.add_argument('--log_interval', type=int, default=10_000,
+                        help='Logging interval in steps (default: 10000)')
+    parser.add_argument('--num_steps', type=int, default=10_000_000,
+                        help='Total number of training steps (default: 1e6)')
+    parser.add_argument('--num_envs', type=int, default=2,
+                        help='Total number of environments (default: 2)')
+
+    ### Problem arguments ###
+
+    parser.add_argument('--num_rows', type=int, default=10,
+                        help='Number of rows in the grid (default: 10)')
+    parser.add_argument('--num_cols', type=int, default=5,
+                        help='Number of columns in the grid (default: 5)')
+    parser.add_argument('--reset_prob', type=float, default=0.2,
+                        help='Probability of resetting the environment (default: 0.2)')
+    parser.add_argument('--paddle_noise', type=float, default=0.2,
+                        help='Noise added to the paddle position (default: 0.2)')
+    parser.add_argument('--reward_delivery_prob', type=float, default=0.2,
+                        help='Probability of delivering a reward (default: 0.2)')
+
+    ### Nibbler-specific arguments ###
+
+    parser.add_argument('--n_gvfs', type=int, default=4,
+                        help='Number of GVFs (default: 4)')
+    parser.add_argument('--inputs_per_gvf', type=int, default=82,
+                        help='Number of inputs per GVFs (default: 82)')
+    parser.add_argument('--hidden_dim_per_gvf', type=int, default=256,
+                        help='Number of hidden units per GVFs (default: 256)')
+    parser.add_argument('--tau_inputs', type=float, default=0.0,
+                        help='Utility difference threshold for replacing GVF inputs (default: 0.0)')
+    parser.add_argument('--tau_cumulants', type=float, default=0.0,
+                        help='Utility difference threshold for replacing GVF cumulants (default: 0.0)')
+    parser.add_argument('--reset_output_weights', action='store_true', default=False,
+                        help='Whether to reset the main value function weights when GVF cumulants are changed (default: False)')
+
+    return parser.parse_args()
+
+
 class Nibbler(eqx.Module):
     total_feature_count: int = eqx.field(static=True)
     n_gvfs: int = eqx.field(static=True)
@@ -770,55 +823,7 @@ def train_model(
 
 def main():
     """Main training script."""
-    parser = argparse.ArgumentParser(description='Train deep Q-learning agent')
-    parser.add_argument('--epsilon', type=float, default=0.1,
-                        help='Exploration probability (default: 0.1)')
-    parser.add_argument('--gamma', type=float, default=0.99,
-                        help='Discount factor (default: 0.99)')
-    parser.add_argument('--seed', type=int, default=None,
-                        help='Random seed (default: None)')
-    parser.add_argument('--step_size_scaling_factor', type=float, default=0.00141,
-                        help='Step size scaling factor, which is divided by sqrt(n_gvfs) (default: 0.001 * sqrt(2))')
-    parser.add_argument('--momentum', type=float, default=0.99,
-                        help='Momentum coefficient for SGD (default: 0.99)')
-    parser.add_argument('--hidden_dims', type=int, nargs='*', default=[256],
-                        help='Hidden layer dimensions (default: None, linear network)')
-    parser.add_argument('--log_interval', type=int, default=10_000,
-                        help='Logging interval in steps (default: 10000)')
-    parser.add_argument('--num_steps', type=int, default=10_000_000,
-                        help='Total number of training steps (default: 1e6)')
-    parser.add_argument('--num_envs', type=int, default=2,
-                        help='Total number of environments (default: 2)')
-    
-    ### Problem arguments ###
-    parser.add_argument('--num_rows', type=int, default=10,
-                        help='Number of rows in the grid (default: 10)')
-    parser.add_argument('--num_cols', type=int, default=5,
-                        help='Number of columns in the grid (default: 5)')
-    parser.add_argument('--reset_prob', type=float, default=0.2,
-                        help='Probability of resetting the environment (default: 0.2)')
-    parser.add_argument('--paddle_noise', type=float, default=0.2,
-                        help='Noise added to the paddle position (default: 0.2)')
-    parser.add_argument('--reward_delivery_prob', type=float, default=0.2,
-                        help='Probability of delivering a reward (default: 0.2)')
-    
-    
-    ### Nibbler-specific arguments ###
-    
-    parser.add_argument('--n_gvfs', type=int, default=4,
-                        help='Number of GVFs (default: 4)')
-    parser.add_argument('--inputs_per_gvf', type=int, default=82,
-                        help='Number of inputs per GVFs (default: 82)')
-    parser.add_argument('--hidden_dim_per_gvf', type=int, default=256,
-                        help='Number of hidden units per GVFs (default: 256)')
-    parser.add_argument('--tau_inputs', type=float, default=0.0,
-                        help='Utility difference threshold for replacing GVF inputs (default: 0.0)')
-    parser.add_argument('--tau_cumulants', type=float, default=0.0,
-                        help='Utility difference threshold for replacing GVF cumulants (default: 0.0)')
-    parser.add_argument('--reset_output_weights', action='store_true', default=False,
-                        help='Whether to reset the main value function weights when GVF cumulants are changed (default: False)')
-    
-    args = parser.parse_args()
+    args = parse_args()
     main_step_size = args.step_size_scaling_factor / np.sqrt(args.n_gvfs)
     configure_jax_config()
     
