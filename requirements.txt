@@ -1,0 +1,16 @@
+# Core dependencies
+jax>=0.6.2
+equinox>=0.13.0
+optax>=0.2.3
+jaxtyping>=0.2.33
+
+# Experiment tracking
+mlflow>=3.7.0
+
+# Utilities
+numpy>=2.2.6
+tqdm>=4.66.5
+
+# Optional: for running catch_env.py visualization
+matplotlib>=3.9.2
+imageio>=2.35.0
