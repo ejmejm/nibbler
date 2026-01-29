@@ -790,10 +790,23 @@ def main():
     parser.add_argument('--num_envs', type=int, default=2,
                         help='Total number of environments (default: 2)')
     
+    ### Problem arguments ###
+    parser.add_argument('--num_rows', type=int, default=10,
+                        help='Number of rows in the grid (default: 10)')
+    parser.add_argument('--num_cols', type=int, default=5,
+                        help='Number of columns in the grid (default: 5)')
+    parser.add_argument('--reset_prob', type=float, default=0.2,
+                        help='Probability of resetting the environment (default: 0.2)')
+    parser.add_argument('--paddle_noise', type=float, default=0.2,
+                        help='Noise added to the paddle position (default: 0.2)')
+    parser.add_argument('--reward_delivery_prob', type=float, default=0.2,
+                        help='Probability of delivering a reward (default: 0.2)')
+    
+    
     ### Nibbler-specific arguments ###
     
     parser.add_argument('--n_gvfs', type=int, default=4,
-                        help='Number of GVFs (default: 10)')
+                        help='Number of GVFs (default: 4)')
     parser.add_argument('--inputs_per_gvf', type=int, default=82,
                         help='Number of inputs per GVFs (default: 82)')
     parser.add_argument('--hidden_dim_per_gvf', type=int, default=256,
@@ -825,12 +838,12 @@ def main():
     # Create environment
     env_state = jax.vmap(
         partial(CatchEnvironmentState,
-            rows = 10,
-            cols = 5,
+            rows = args.num_rows,
+            cols = args.num_cols,
             hot_prob = min(2.0 / args.num_envs, 1.0),
-            reset_prob = 0.2,
-            paddle_noise = 0.2,
-            reward_delivery_prob = 0.2,
+            reset_prob = args.reset_prob,
+            paddle_noise = args.paddle_noise,
+            reward_delivery_prob = args.reward_delivery_prob,
         ),
         in_axes = 0,
     )(seed=env_seeds)
