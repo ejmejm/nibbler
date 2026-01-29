@@ -32,6 +32,7 @@ class Nibbler(eqx.Module):
     n_actions: int = eqx.field(static=True)
     input_replace_threshold: float = eqx.field(static=True)
     cumulant_replace_threshold: float = eqx.field(static=True)
+    reset_output_weights: bool = eqx.field(static=True)
     
     output_layer: QVNetwork
     gvf_networks: QVNetwork # vampped for n_gvfs
@@ -50,6 +51,7 @@ class Nibbler(eqx.Module):
         n_gvfs: int, # h
         input_replace_threshold: float = 0.0, # tau_K
         cumulant_replace_threshold: float = 0.0, # tau_I
+        reset_output_weights: bool = False,
         *,
         key: random.PRNGKey,
     ):
@@ -64,6 +66,7 @@ class Nibbler(eqx.Module):
             n_gvfs: Number of GVFs
             input_replace_threshold: Utility difference threshold for replacing GVF inputs
             cumulant_replace_threshold: Utility difference threshold for replacing GVF cumulants
+            reset_output_weights: Whether to reset the main value function weights when GVF cumulants are changed
             key: Random key for initialization
         """
         self.rng, output_key, reward_predictor_key, gvf_key, linear_gvf_value_key = random.split(key, 5)
@@ -76,6 +79,7 @@ class Nibbler(eqx.Module):
         self.total_feature_count = obs_dim + hidden_dim_per_gvf * n_gvfs
         self.input_replace_threshold = input_replace_threshold
         self.cumulant_replace_threshold = cumulant_replace_threshold
+        self.reset_output_weights = reset_output_weights
         
         # Output layer: QVNetwork with linear action value and value functions
         self.output_layer = QVNetwork(
@@ -228,21 +232,24 @@ class Nibbler(eqx.Module):
         
         gvf_weight_reset_mask = jax.tree.map(make_gvf_weight_reset_mask, full_zeros_mask.gvf_networks)
         
-        # Then fill out the output layer weight reset mask
-        start_idx = self.obs_dim + changed_gvf_idx * self.hidden_dim_per_gvf
-        end_idx = start_idx + self.hidden_dim_per_gvf * is_changed
-        # Use dynamic indexing with a boolean mask since start_idx/end_idx are traced
-        def make_output_weight_reset_mask(zeros: Bool[Array, 'n_actions n_features']) -> Bool[Array, 'n_actions n_features']:
-            n_features = zeros.shape[1]
-            feature_indices = jnp.arange(n_features)
-            feature_mask = (feature_indices >= start_idx) & (feature_indices < end_idx)
-            return jnp.where(feature_mask[None, :], is_changed, zeros)
-        
-        # Map setting the mask over the state value and action value weights
-        output_weight_reset_mask = jax.tree.map(
-            make_output_weight_reset_mask,
-            full_zeros_mask.output_layer,
-        )
+        if self.reset_output_weights:
+            # Then fill out the output layer weight reset mask
+            start_idx = self.obs_dim + changed_gvf_idx * self.hidden_dim_per_gvf
+            end_idx = start_idx + self.hidden_dim_per_gvf * is_changed
+            # Use dynamic indexing with a boolean mask since start_idx/end_idx are traced
+            def make_output_weight_reset_mask(zeros: Bool[Array, 'n_actions n_features']) -> Bool[Array, 'n_actions n_features']:
+                n_features = zeros.shape[1]
+                feature_indices = jnp.arange(n_features)
+                feature_mask = (feature_indices >= start_idx) & (feature_indices < end_idx)
+                return jnp.where(feature_mask[None, :], is_changed, zeros)
+            
+            # Map setting the mask over the state value and action value weights
+            output_weight_reset_mask = jax.tree.map(
+                make_output_weight_reset_mask,
+                full_zeros_mask.output_layer,
+            )
+        else:
+            output_weight_reset_mask = full_zeros_mask.output_layer
         
         full_weight_mask = tree_replace(
             full_zeros_mask,
@@ -795,6 +802,8 @@ def main():
                         help='Utility difference threshold for replacing GVF inputs (default: 0.0)')
     parser.add_argument('--tau_cumulants', type=float, default=0.0,
                         help='Utility difference threshold for replacing GVF cumulants (default: 0.0)')
+    parser.add_argument('--reset_output_weights', action='store_true', default=False,
+                        help='Whether to reset the main value function weights when GVF cumulants are changed (default: False)')
     
     args = parser.parse_args()
     main_step_size = args.step_size_scaling_factor / np.sqrt(args.n_gvfs)
@@ -840,6 +849,7 @@ def main():
         n_gvfs = args.n_gvfs,
         input_replace_threshold = args.tau_inputs,
         cumulant_replace_threshold = args.tau_cumulants,
+        reset_output_weights = args.reset_output_weights,
         key = agent_key,
     )
     
