@@ -211,6 +211,9 @@ class Nibbler(eqx.Module):
         
         # The paper mentions resetting w^pos_u, but not w^pos_v or w^pos_q,a. It probably is resetting all three though (and output weights), right?
         # I'm going to assume that this is a bug in the paper and that all of the GVF network's weights and momentum states should be reset.
+        # If I'm going to do that then I should also consider resetting the linear GVF value predictors weights when I reset the GVF networks.
+        # Though maybe they actually dont reset the other weights because they are linear and should be able to recover.
+        # TODO: I should also try it just as the paper writes it when I'm done with the implementation.
         
         # Start with a mask of zeros for the full model
         full_zeros_mask: Nibbler = jax.tree.map(
@@ -248,6 +251,37 @@ class Nibbler(eqx.Module):
         )
         
         return new_cumulant_feature_idxs, full_weight_mask
+    
+    
+    def _get_updated_gvf_input_feature_idxs_and_reset_mask(
+        self,
+    ) -> Tuple[Int[Array, 'n_gvfs inputs_per_gvf'], Bool[Array, 'n_gvfs hidden_dim_per_gvf inputs_per_gvf']]:
+        """Computes the new GVF input feature idxs and a mask for weights in the GVF network input layers that need to be reset."""
+        
+        @partial(jax.vmap, in_axes=0)
+        def update_gvf_input_feature_idxs(
+            input_indices: Int[Array, 'inputs_per_gvf'],
+            utilities: Float[Array, 'obs_dim']
+        ) -> Int[Array, 'inputs_per_gvf']:
+            new_input_feature_idxs, selection_mask, is_changed, changed_input_idx = incremental_top_k(
+                selected_indices = input_indices,
+                feature_utilities = utilities,
+                num_features = self.obs_dim,
+                tau = self.input_replace_threshold,
+            )
+            
+            # Mask assumes the shape of all GVF networks is the same
+            weight_reset_mask = jnp.zeros((self.hidden_dim_per_gvf, self.inputs_per_gvf), dtype=jnp.bool_)
+            weight_reset_mask = weight_reset_mask.at[:, changed_input_idx].set(is_changed)
+            
+            return new_input_feature_idxs, weight_reset_mask
+            
+        base_feature_utilities = jnp.abs(self.linear_gvf_predictors.layers[0].weight.squeeze(axis=1))
+        
+        new_gvf_input_feature_idxs, weight_reset_mask = update_gvf_input_feature_idxs(
+            self.gvf_input_feature_idxs, base_feature_utilities)
+        
+        return new_gvf_input_feature_idxs, weight_reset_mask
         
     
     def compute_grads_and_loss(
@@ -334,6 +368,7 @@ class Nibbler(eqx.Module):
             output_layer = output_layer_grads,
             reward_predictor = reward_grads,
             gvf_networks = gvf_grads,
+            linear_gvf_predictors = linear_gvf_predictor_grads,
         )
         
         losses = {
@@ -357,8 +392,20 @@ class Nibbler(eqx.Module):
         optimizer_state: optax.OptState,
     ) -> Tuple['Nibbler', optax.OptState]:
         # Compute GVF input and cumulant changes
-        new_cumulant_feature_idxs, weight_reset_masks = self._get_updated_gvf_cumulant_feature_idxs_and_reset_mask()
-        # TODO: Add input feature resetting
+        new_cumulant_feature_idxs, cumulant_weight_reset_masks = self._get_updated_gvf_cumulant_feature_idxs_and_reset_mask()
+        new_gvf_input_feature_idxs, input_weight_reset_mask = self._get_updated_gvf_input_feature_idxs_and_reset_mask()
+        
+        # The cumulant masks are for the whole network, and the input masks are only for the GVF network input layers,
+        # so use the cumulant mask as a base to combine the two masks.
+        gvf_input_layer_weight_reset_mask = (
+            cumulant_weight_reset_masks.gvf_networks.shared_mlp.layers[0].weight |
+            input_weight_reset_mask
+        )
+        weight_reset_masks = eqx.tree_at(
+            lambda x: x.gvf_networks.shared_mlp.layers[0].weight,
+            cumulant_weight_reset_masks,
+            gvf_input_layer_weight_reset_mask,
+        )
         
         # Reset GVF weights according to the changes
         new_rng, gvf_key = random.split(self.rng)
@@ -377,6 +424,7 @@ class Nibbler(eqx.Module):
         updated_agent: Nibbler = tree_replace(
             self,
             gvf_cumulant_feature_idxs = new_cumulant_feature_idxs,
+            gvf_input_feature_idxs = new_gvf_input_feature_idxs,
             gvf_networks = updated_gvf_networks,
             output_layer = updated_output_layer,
             rng = new_rng,
@@ -460,7 +508,7 @@ def incremental_top_k(
     
     changed = feature_utilities[low_idx] + tau < feature_utilities[high_idx]
     
-    selection_mask = selection_mask.at[low_idx].set(1 - changed)
+    selection_mask = selection_mask.at[low_idx].set(~changed)
     selection_mask = selection_mask.at[high_idx].set(changed)
     # Beware, this will fail silently if `selected_indices` does not have `low_idx`
     low_pos_in_selected_indices = jnp.argmax(selected_indices == low_idx)
@@ -488,9 +536,6 @@ def reset_sgd_momentum_optim_states(
         f"but got {optimizer_state[1]} and {optimizer_state[2]}."
     )
     
-    # TODO: Fix error, looks at `[x.shape for x in jax.tree.leaves(optimizer_state[0].trace)]`
-    #       vs. `[x.shape for x in jax.tree.leaves(state_reset_masks)]`
-    #       The reset mask has 3 extra leaves
     new_trace_state = jax.tree.map(
         lambda reset_mask, curr_state: jnp.where(
             reset_mask, jnp.zeros_like(curr_state), curr_state),
@@ -672,18 +717,18 @@ def train_model(
         train_state, metrics = multi_step_train(train_state)
         
         
+        ### For debugging changing GVF cumulant and input indices ###
         
-        cumulant_feature_idxs = train_state.agent.gvf_cumulant_feature_idxs
-        utilities = jnp.abs(train_state.agent.reward_predictor.layers[0].weight.squeeze(axis=0))
-        # Compute ranks: highest utility = rank 1, lowest = rank N
-        utility_sort_indices = jnp.argsort(-utilities)  # descending order
-        # Create a mapping from feature index to rank
-        rank_map = {int(idx): int(rank) + 1 for rank, idx in enumerate(utility_sort_indices.tolist())}
-        feature_idxs_list = cumulant_feature_idxs.tolist()
-        print("GVF cumulant feature indices:", feature_idxs_list)
-        print("Utility ranks of those indices:", [rank_map.get(int(idx), None) for idx in feature_idxs_list])
-        
-        
+        # cumulant_feature_idxs = train_state.agent.gvf_cumulant_feature_idxs
+        # utilities = jnp.abs(train_state.agent.reward_predictor.layers[0].weight.squeeze(axis=0))
+        # # Compute ranks: highest utility = rank 1, lowest = rank N
+        # utility_sort_indices = jnp.argsort(-utilities)  # descending order
+        # # Create a mapping from feature index to rank
+        # rank_map = {int(idx): int(rank) + 1 for rank, idx in enumerate(utility_sort_indices.tolist())}
+        # feature_idxs_list = cumulant_feature_idxs.tolist()
+        # print("GVF cumulant feature indices:", feature_idxs_list)
+        # print("Utility ranks of those indices:", [rank_map.get(int(idx), None) for idx in feature_idxs_list])
+        # print("GVF_0 input feature indices:", train_state.agent.gvf_input_feature_idxs[0])
         
         
         # Average metrics
@@ -725,8 +770,8 @@ def main():
                         help='Discount factor (default: 0.99)')
     parser.add_argument('--seed', type=int, default=None,
                         help='Random seed (default: None)')
-    parser.add_argument('--learning_rate', type=float, default=0.001,
-                        help='Learning rate scaling factor, which is multiplied by sqrt(2)/sqrt(n_gvfs) (default: 0.001)')
+    parser.add_argument('--step_size_scaling_factor', type=float, default=0.00141,
+                        help='Step size scaling factor, which is divided by sqrt(n_gvfs) (default: 0.001 * sqrt(2))')
     parser.add_argument('--momentum', type=float, default=0.99,
                         help='Momentum coefficient for SGD (default: 0.99)')
     parser.add_argument('--hidden_dims', type=int, nargs='*', default=[256],
@@ -748,7 +793,7 @@ def main():
                         help='Number of hidden units per GVFs (default: 256)')
     
     args = parser.parse_args()
-    args.learning_rate *= np.sqrt(2) / np.sqrt(args.n_gvfs)
+    main_step_size = args.step_size_scaling_factor / np.sqrt(args.n_gvfs)
     configure_jax_config()
     
     key = (
@@ -760,7 +805,7 @@ def main():
     
     # Create optimizer
     optimizer = create_optimizer(
-        learning_rate = args.learning_rate,
+        learning_rate = main_step_size,
         momentum = args.momentum,
     )
     
